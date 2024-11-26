@@ -5,6 +5,7 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 using Newtonsoft.Json;
 using System.Collections.Concurrent;
 using System.Drawing;
+using System.Linq;
 using System.Runtime.InteropServices;
 using Emgu.CV.CvEnum;
 
@@ -156,23 +157,23 @@ namespace BingLing.Yolov5Onnx.Gpu
         /// 摆烂进行预测[适用于性能要求不太高的场景]，适当占用CPU
         /// </summary>
         /// <param name="mat">Emgu.CV.Mat图片对象</param>
-        /// <returns>预测结果字典，key为类型，value为预测结果</returns>
-        public ConcurrentDictionary<int, List<Prediction>> DetectLetItRot(Mat mat)
+        /// <returns>预测结果，包含处理后的图像和检测框数据</returns>
+        public DetectionResult DetectLetItRot(Mat mat)
         {
             float proportion_x = 1f * mat.Width / _modelInputSize.Width;
             float proportion_y = 1f * mat.Height / _modelInputSize.Height;
 
-            // 使用预分配的Mat进行resize
+            // 使用预分配的Mat进行resize并克隆原图用于绘制
+            Mat processedImage = mat.Clone();
             CvInvoke.Resize(mat, _resizedMat, _modelInputSize);
 
             lock (_bufferLock)
             {
-                // 直接复制图像数据到预分配的buffer
                 Marshal.Copy(_resizedMat.DataPointer, _imageBuffer, 0, _imageBuffer.Length);
 
                 // 使用SIMD优化的并行处理
                 int pixelCount = _modelInputSize.Width * _modelInputSize.Height;
-                int vectorSize = 4; // Process 4 pixels at a time
+                int vectorSize = 4;
                 int remainingStart = (pixelCount / vectorSize) * vectorSize;
 
                 Parallel.For(0, pixelCount / vectorSize, i =>
@@ -191,7 +192,6 @@ namespace BingLing.Yolov5Onnx.Gpu
                     }
                 });
 
-                // Handle remaining pixels
                 for (int i = remainingStart; i < pixelCount; i++)
                 {
                     int row = i / _modelInputSize.Width;
@@ -211,7 +211,50 @@ namespace BingLing.Yolov5Onnx.Gpu
                 using var values = inference_session.Run(inputs);
                 float[] result = values.First(value => value.Name == _outputMetadataName).AsEnumerable<float>().ToArray();
 
-                return ProcessPredictions(result, proportion_x, proportion_y);
+                var predictions = ProcessPredictions(result, proportion_x, proportion_y);
+                
+                // Draw boxes on the image
+                foreach (var kvp in predictions)
+                {
+                    foreach (var pred in kvp.Value)
+                    {
+                        var rect = new Rectangle(
+                            (int)pred.X,
+                            (int)pred.Y,
+                            (int)pred.Width,
+                            (int)pred.Height
+                        );
+                        CvInvoke.Rectangle(processedImage, rect, new MCvScalar(0, 255, 0), 2);
+                        CvInvoke.PutText(processedImage, 
+                            $"{kvp.Key} {pred.Confidence:F2}", 
+                            new Point((int)pred.X, (int)pred.Y - 10),
+                            FontFace.HersheyTriplex,
+                            0.8,
+                            new MCvScalar(255, 0, 0),
+                            1,
+                            LineType.AntiAlias);
+                    }
+                }
+
+                // Convert predictions to output format similar to Python
+                int totalPredictions = predictions.Sum(p => p.Value.Count);
+                var outputs = new float[totalPredictions, 6];
+                int idx = 0;
+                foreach (var kvp in predictions)
+                {
+                    foreach (var pred in kvp.Value)
+                    {
+                        outputs[idx, 0] = pred.X;
+                        outputs[idx, 1] = pred.Y;
+                        outputs[idx, 2] = pred.X + pred.Width;
+                        outputs[idx, 3] = pred.Y + pred.Height;
+                        outputs[idx, 4] = pred.Confidence;
+                        outputs[idx, 5] = kvp.Key;
+                        idx++;
+                    }
+                }
+
+                return new DetectionResult(processedImage, outputs);
             }
         }
 
@@ -294,8 +337,8 @@ namespace BingLing.Yolov5Onnx.Gpu
         /// 全力进行预测[适用于性能要求比较高的场景]，超高占用CPU
         /// </summary>
         /// <param name="mat">Emgu.CV.Mat图片对象</param>
-        /// <returns>预测结果字典，key为类型，value为预测结果</returns>
-        public ConcurrentDictionary<int, List<Prediction>> DetectAllOut(Mat mat)
+        /// <returns>预测结果，包含处理后的图像和检测框数据</returns>
+        public DetectionResult DetectAllOut(Mat mat)
         {
             #region yolov5模型一般来说就一个输入和一个输出
             //输入参数的名称
@@ -312,6 +355,7 @@ namespace BingLing.Yolov5Onnx.Gpu
             float proportion_y = 1f * mat.Height / input_dimensions[2];
 
             //拷贝一份新的图片对象，避免修改源图像尺寸
+            Mat processedImage = mat.Clone();
             using var resizedMat = mat.Clone();
             CvInvoke.Resize(resizedMat, resizedMat, new Size(input_dimensions[3], input_dimensions[2]));
 
@@ -334,7 +378,50 @@ namespace BingLing.Yolov5Onnx.Gpu
             var inputs = new List<NamedOnnxValue> { NamedOnnxValue.CreateFromTensor(InputMetadataName, dense_tensor) };
             using var results = inference_session.Run(inputs);
             var resultsArray = results.First().AsEnumerable<float>().ToArray();
-            return ProcessResults(resultsArray, proportion_x, proportion_y);
+            var predictions = ProcessResults(resultsArray, proportion_x, proportion_y);
+
+            // Draw boxes on the image
+            foreach (var kvp in predictions)
+            {
+                foreach (var pred in kvp.Value)
+                {
+                    var rect = new Rectangle(
+                        (int)pred.X,
+                        (int)pred.Y,
+                        (int)pred.Width,
+                        (int)pred.Height
+                    );
+                    CvInvoke.Rectangle(processedImage, rect, new MCvScalar(0, 255, 0), 2);
+                    CvInvoke.PutText(processedImage, 
+                        $"{kvp.Key} {pred.Confidence:F2}", 
+                        new Point((int)pred.X, (int)pred.Y - 10),
+                        FontFace.HersheyTriplex,
+                        0.8,
+                        new MCvScalar(255, 0, 0),
+                        1,
+                        LineType.AntiAlias);
+                }
+            }
+
+            // Convert predictions to output format similar to Python
+            int totalPredictions = predictions.Sum(p => p.Value.Count);
+            var outputs = new float[totalPredictions, 6];
+            int idx = 0;
+            foreach (var kvp in predictions)
+            {
+                foreach (var pred in kvp.Value)
+                {
+                    outputs[idx, 0] = pred.X;
+                    outputs[idx, 1] = pred.Y;
+                    outputs[idx, 2] = pred.X + pred.Width;
+                    outputs[idx, 3] = pred.Y + pred.Height;
+                    outputs[idx, 4] = pred.Confidence;
+                    outputs[idx, 5] = kvp.Key;
+                    idx++;
+                }
+            }
+
+            return new DetectionResult(processedImage, outputs);
         }
 
         private ConcurrentDictionary<int, List<Prediction>> ProcessResults(float[] resultsArray, float proportion_x, float proportion_y)
@@ -416,6 +503,18 @@ namespace BingLing.Yolov5Onnx.Gpu
             });
 
             return dictionary;
+        }
+
+        public class DetectionResult
+        {
+            public Mat ProcessedImage { get; set; }
+            public float[,] Outputs { get; set; }
+
+            public DetectionResult(Mat processedImage, float[,] outputs)
+            {
+                ProcessedImage = processedImage;
+                Outputs = outputs;
+            }
         }
 
         public void Dispose()

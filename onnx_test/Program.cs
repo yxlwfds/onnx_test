@@ -101,11 +101,38 @@ namespace TestNugetCpuOnnx
                                             Console.WriteLine($"图像尺寸: {frame.Size}");
                                             // Perform inference
                                             var stopwatch = Stopwatch.StartNew();
-                                            var predictions = yolov5Onnx.DetectLetItRot(frame);
+                                            var detectionResult = yolov5Onnx.DetectLetItRot(frame);
                                             stopwatch.Stop();
 
                                             Console.WriteLine($"推理完成. 耗时: {stopwatch.ElapsedMilliseconds}毫秒");
-                                            Console.WriteLine($"检测到的物体数量: {predictions.Sum(p => p.Value.Count)}");
+                                            
+                                            // 获取处理后的图片
+                                            Mat processedImage = detectionResult.ProcessedImage;
+                                            // 获取检测框数据
+                                            float[,] detections = detectionResult.Outputs;
+                                            
+                                            // 打印检测到的物体数量
+                                            Console.WriteLine($"检测到的物体数量: {detections.GetLength(0)}");
+                                            
+                                            // 处理每个检测框的数据
+                                            for (int i = 0; i < detections.GetLength(0); i++)
+                                            {
+                                                float x1 = detections[i, 0];
+                                                float y1 = detections[i, 1];
+                                                float x2 = detections[i, 2];
+                                                float y2 = detections[i, 3];
+                                                float confidence = detections[i, 4];
+                                                int classId = (int)detections[i, 5];
+                                                
+                                                Console.WriteLine($"检测框 {i + 1}:");
+                                                Console.WriteLine($"  位置: ({x1}, {y1}) - ({x2}, {y2})");
+                                                Console.WriteLine($"  置信度: {confidence:F2}");
+                                                Console.WriteLine($"  类别ID: {classId}");
+                                            }
+                                            
+                                            // 显示处理后的图片
+                                            CvInvoke.Imshow("Processed Frame", processedImage);
+                                            CvInvoke.WaitKey(1);
                                         }
                                     }
                                 }
