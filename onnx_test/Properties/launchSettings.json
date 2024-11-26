@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "onnx_test": {
+      "commandName": "Project",
+      "commandLineArgs": "stream5 yolov5_onnx.json"
+    }
+  }
+}

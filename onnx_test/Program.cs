@@ -1,4 +1,4 @@
-﻿using BingLing.Yolov5Onnx.Gpu;
+using BingLing.Yolov5Onnx.Gpu;
 using Emgu.CV;
 using Emgu.CV.CvEnum;
 using Emgu.CV.Structure;
@@ -7,6 +7,7 @@ using System.Diagnostics;
 using StackExchange.Redis;
 using System.Text;
 using System.Runtime.InteropServices;
+using System.IO;
 
 namespace TestNugetCpuOnnx
 {
@@ -14,13 +15,26 @@ namespace TestNugetCpuOnnx
     {
         static async Task Main(string[] args)
         {
+            if (args.Length != 2)
+            {
+                Console.WriteLine("Usage: program <stream_name> <config_file_path>");
+                return;
+            }
+
+            string streamName = args[0];
+            string configPath = args[1];
+
+            if (!File.Exists(configPath))
+            {
+                Console.WriteLine($"Error: Configuration file not found at path: {configPath}");
+                return;
+            }
+
             ConnectionMultiplexer? redis = null;
             Yolov5Onnx? yolov5Onnx = null;
             
             try
             {
-                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                string configPath = Path.Combine(baseDir, "yolov5_onnx.json");
                 Console.WriteLine("配置文件路径:" + configPath);
 
                 // Initialize model and GPU resources
@@ -33,7 +47,6 @@ namespace TestNugetCpuOnnx
                 redis = ConnectionMultiplexer.Connect("127.0.0.1:6379");
                 var db = redis.GetDatabase();
 
-                string streamName = "stream5"; // 替换为实际的stream名称
                 string lastId = "0-0";
                 DateTime lastActive = DateTime.Now;
                 MCvScalar color = new(255, 0, 0);
@@ -131,8 +144,8 @@ namespace TestNugetCpuOnnx
                                             }
                                             
                                             // 显示处理后的图片
-                                            CvInvoke.Imshow("Processed Frame", processedImage);
-                                            CvInvoke.WaitKey(1);
+                                            // CvInvoke.Imshow("Processed Frame", processedImage);
+                                            // CvInvoke.WaitKey(1);
                                         }
                                     }
                                 }
