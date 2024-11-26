@@ -1,17 +1,19 @@
-﻿using Emgu.CV;
+using Emgu.CV;
 using Emgu.CV.Structure;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using Newtonsoft.Json;
 using System.Collections.Concurrent;
 using System.Drawing;
+using System.Runtime.InteropServices;
+using Emgu.CV.CvEnum;
 
 namespace BingLing.Yolov5Onnx.Gpu
 {
     /// <summary>
     /// Yolo类
     /// </summary>
-    public class Yolov5Onnx
+    public class Yolov5Onnx : IDisposable
     {
         /// <summary>
         /// yolov5 onnx文件的物理路径
@@ -84,6 +86,20 @@ namespace BingLing.Yolov5Onnx.Gpu
             }
         }
 
+        private DenseTensor<float>? _reuseInputTensor;
+        private byte[]? _imageBuffer;
+        private float[]? _processingBuffer;
+        private readonly object _bufferLock = new object();
+        private Mat? _resizedMat;
+        private readonly Size _modelInputSize;
+        private readonly string _inputMetadataName;
+        private readonly string _outputMetadataName;
+        private readonly int[] _outputDimensions;
+        private readonly int _lengthOfPredict;
+        private readonly int _countOfKind;
+
+        private bool _disposed = false;
+
         /// <summary>
         /// 以json配置文件构造Yolo对象，例如
         /// <![CDATA[
@@ -112,6 +128,28 @@ namespace BingLing.Yolov5Onnx.Gpu
 
             ModelManager.Initialize(configPath);
             this.inference_session = ModelManager.InferenceSession;
+            
+            // Cache metadata names
+            _inputMetadataName = inference_session.InputNames[0];
+            _outputMetadataName = inference_session.OutputNames[0];
+            
+            // Pre-allocate model input size
+            var dimensions = inference_session.InputMetadata[_inputMetadataName].Dimensions;
+            _modelInputSize = new Size(dimensions[3], dimensions[2]);
+            
+            // Cache output dimensions
+            _outputDimensions = inference_session.OutputMetadata[_outputMetadataName].Dimensions;
+            _lengthOfPredict = _outputDimensions[1];
+            _countOfKind = _outputDimensions[2] - 5;
+            
+            // Pre-allocate reusable Mat
+            _resizedMat = new Mat(_modelInputSize.Height, _modelInputSize.Width, DepthType.Cv8U, 3);
+            
+            // Pre-allocate buffers
+            int maxSize = _modelInputSize.Width * _modelInputSize.Height * 3;
+            _imageBuffer = new byte[maxSize];
+            _processingBuffer = new float[maxSize];
+            _reuseInputTensor = new DenseTensor<float>(dimensions);
         }
 
         /// <summary>
@@ -121,128 +159,133 @@ namespace BingLing.Yolov5Onnx.Gpu
         /// <returns>预测结果字典，key为类型，value为预测结果</returns>
         public ConcurrentDictionary<int, List<Prediction>> DetectLetItRot(Mat mat)
         {
-            #region yolov5模型一般来说就一个输入和一个输出
-            //输入参数的名称
-            string InputMetadataName = inference_session!.InputNames[0];
-            //输出参数的名称
-            string OutputMetadataName = inference_session!.OutputNames[0];
-            #endregion
+            float proportion_x = 1f * mat.Width / _modelInputSize.Width;
+            float proportion_y = 1f * mat.Height / _modelInputSize.Height;
 
-            //获得模型的输入维度
-            int[] input_dimensions = inference_session!.InputMetadata[InputMetadataName].Dimensions;
+            // 使用预分配的Mat进行resize
+            CvInvoke.Resize(mat, _resizedMat, _modelInputSize);
 
-            //计算图片尺寸和模型尺寸的比例
-            float proportion_x = 1f * mat.Width / input_dimensions[3];
-            float proportion_y = 1f * mat.Height / input_dimensions[2];
-
-            //拷贝一份新的图片对象，避免修改源图像尺寸
-            mat = mat.Clone();
-
-            //缩放至模型输入大小
-            CvInvoke.Resize(mat, mat, new Size(input_dimensions[3], input_dimensions[2]));
-
-            //根据输入维度创建输入的稠密张量
-            DenseTensor<float> dense_tensor = new(input_dimensions);
-
-            //yolov5预测的一般都是彩色图[三通道]，即时传入图片的是灰度图也无所谓，只要模型是预测三通道图片的就可以
-            byte[,,] image = (byte[,,])mat.GetData();
-            for (int i = 0; i < mat.Height; i++)
+            lock (_bufferLock)
             {
-                for (int j = 0; j < mat.Width; j++)
+                // 直接复制图像数据到预分配的buffer
+                Marshal.Copy(_resizedMat.DataPointer, _imageBuffer, 0, _imageBuffer.Length);
+
+                // 使用SIMD优化的并行处理
+                int pixelCount = _modelInputSize.Width * _modelInputSize.Height;
+                int vectorSize = 4; // Process 4 pixels at a time
+                int remainingStart = (pixelCount / vectorSize) * vectorSize;
+
+                Parallel.For(0, pixelCount / vectorSize, i =>
                 {
-                    dense_tensor[0, 0, i, j] = (float)(image[i, j, 0] / 255f);
-                    dense_tensor[0, 1, i, j] = (float)(image[i, j, 1] / 255f);
-                    dense_tensor[0, 2, i, j] = (float)(image[i, j, 2] / 255f);
+                    int baseIdx = i * vectorSize * 3;
+                    for (int j = 0; j < vectorSize; j++)
+                    {
+                        int pixelIdx = i * vectorSize + j;
+                        int row = pixelIdx / _modelInputSize.Width;
+                        int col = pixelIdx % _modelInputSize.Width;
+                        int srcIdx = baseIdx + j * 3;
+
+                        _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx] / 255f;
+                        _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f;
+                        _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx + 2] / 255f;
+                    }
+                });
+
+                // Handle remaining pixels
+                for (int i = remainingStart; i < pixelCount; i++)
+                {
+                    int row = i / _modelInputSize.Width;
+                    int col = i % _modelInputSize.Width;
+                    int srcIdx = i * 3;
+
+                    _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx] / 255f;
+                    _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f;
+                    _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx + 2] / 255f;
                 }
+
+                var inputs = new List<NamedOnnxValue>
+                {
+                    NamedOnnxValue.CreateFromTensor(_inputMetadataName, _reuseInputTensor)
+                };
+
+                using var values = inference_session.Run(inputs);
+                float[] result = values.First(value => value.Name == _outputMetadataName).AsEnumerable<float>().ToArray();
+
+                return ProcessPredictions(result, proportion_x, proportion_y);
             }
+        }
 
-            //构建输入
-            var inputs = new List<NamedOnnxValue>
+        private ConcurrentDictionary<int, List<Prediction>> ProcessPredictions(float[] result, float proportion_x, float proportion_y)
+        {
+            var dictionary = new ConcurrentDictionary<int, List<Prediction>>();
+
+            // 使用并行处理预测结果
+            Parallel.For(0, _lengthOfPredict, i =>
             {
-                NamedOnnxValue.CreateFromTensor(InputMetadataName, dense_tensor)
-            };
-
-            //推理预测
-            IDisposableReadOnlyCollection<DisposableNamedOnnxValue> values = inference_session.Run(inputs);
-
-            //把推理结果转换成一维数组
-            float[] result = values.First(value => value.Name == OutputMetadataName).AsEnumerable<float>().ToArray();
-            //释放资源
-            values.Dispose();
-
-            ConcurrentDictionary<int, List<Prediction>> dictionary = new();
-            int[] output_dimensions = inference_session.OutputMetadata[OutputMetadataName].Dimensions;
-
-            int length_of_predict = output_dimensions[1];
-            int count_of_kind = output_dimensions[2] - 5;
-            //解析输出并过滤掉低置信度的预测结果
-            for (int i = 0; i < length_of_predict; i++)
-            {
-                int j = i * (count_of_kind + 5);
+                int j = i * (_countOfKind + 5);
                 float confidence = result[j + 4];
                 if (confidence >= this.confidence)
                 {
                     int kind = j + 5;
-                    for (int k = kind + 1; k < j + count_of_kind + 5; k++)
+                    for (int k = kind + 1; k < j + _countOfKind + 5; k++)
                     {
                         if (result[k] > result[kind])
                         {
                             kind = k;
                         }
                     }
-                    kind = kind % (count_of_kind + 5) - 5;
+                    kind = kind % (_countOfKind + 5) - 5;
 
-                    if (!dictionary.ContainsKey(kind))
-                    {
-                        dictionary.TryAdd(kind, new List<Prediction>());
-                    }
-
-                    dictionary[kind].Add(new Prediction(kind, result[j], result[j + 1], result[j + 2], result[j + 3], confidence));
+                    dictionary.AddOrUpdate(kind,
+                        _ => new List<Prediction> { new(kind, result[j], result[j + 1], result[j + 2], result[j + 3], confidence) },
+                        (_, list) =>
+                        {
+                            lock (list)
+                            {
+                                list.Add(new(kind, result[j], result[j + 1], result[j + 2], result[j + 3], confidence));
+                            }
+                            return list;
+                        });
                 }
-            }
+            });
 
-            //NMS算法[同一种预测类别且交并比大于设定阈值的两个预测结果视为同一个目标]，去除针对同一目标的多余预测结果
-            List<int> kinds = new List<int>(dictionary.Keys);
-            foreach (var kind in kinds)
+            // 并行处理NMS
+            Parallel.ForEach(dictionary.Keys, kind =>
             {
-                List<Prediction> predictions = dictionary[kind];
-                predictions.Sort();
-
-                HashSet<Prediction> hashSet = new HashSet<Prediction>();
-                for (int i = 0; i < predictions.Count; i++)
+                var predictions = dictionary[kind];
+                lock (predictions)
                 {
-                    if (hashSet.Contains(predictions[i]))
-                    {
-                        continue;
-                    }
-                    for (int j = i + 1; j < predictions.Count; j++)
-                    {
-                        if (hashSet.Contains(predictions[j]))
-                        {
-                            continue;
-                        }
+                    predictions.Sort();
+                    var toRemove = new HashSet<Prediction>();
 
-                        if (predictions[i].IOU(predictions[j]) >= iou)
+                    for (int i = 0; i < predictions.Count; i++)
+                    {
+                        if (toRemove.Contains(predictions[i])) continue;
+                        
+                        for (int j = i + 1; j < predictions.Count; j++)
                         {
-                            hashSet.Add(predictions[j]);
+                            if (toRemove.Contains(predictions[j])) continue;
+                            
+                            if (predictions[i].IOU(predictions[j]) >= iou)
+                            {
+                                toRemove.Add(predictions[j]);
+                            }
                         }
                     }
-                }
 
-                foreach (var item in hashSet)
-                {
-                    predictions.Remove(item);
-                }
+                    // 批量移除
+                    predictions.RemoveAll(p => toRemove.Contains(p));
 
-                //根据比例缩放回来
-                foreach (var prediction in predictions)
-                {
-                    prediction.X *= proportion_x;
-                    prediction.Y *= proportion_y;
-                    prediction.Width *= proportion_x;
-                    prediction.Height *= proportion_y;
+                    // 批量缩放
+                    for (int i = 0; i < predictions.Count; i++)
+                    {
+                        predictions[i].X *= proportion_x;
+                        predictions[i].Y *= proportion_y;
+                        predictions[i].Width *= proportion_x;
+                        predictions[i].Height *= proportion_y;
+                    }
                 }
-            }
+            });
 
             return dictionary;
         }
@@ -375,12 +418,33 @@ namespace BingLing.Yolov5Onnx.Gpu
             return dictionary;
         }
 
-        /// <summary>
-        /// 析构函数，释放yolov5对象时，把推理会话释放掉避免内存泄漏
-        /// </summary>
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!_disposed)
+            {
+                if (disposing)
+                {
+                    // Dispose managed resources
+                    _reuseInputTensor = null;
+                    _imageBuffer = null;
+                    _processingBuffer = null;
+                    _resizedMat?.Dispose();
+                    _resizedMat = null;
+                }
+
+                _disposed = true;
+            }
+        }
+
         ~Yolov5Onnx()
         {
-            this.inference_session?.Dispose();
+            Dispose(false);
         }
     }
 }

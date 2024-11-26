@@ -33,7 +33,20 @@ namespace BingLing.Yolov5Onnx.Gpu
 
             // Initialize GPU session
             var sessionOptions = new SessionOptions();
+            sessionOptions.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
+            sessionOptions.EnableMemoryPattern = true;
+            sessionOptions.EnableProfiling = false;
+            sessionOptions.EnableCpuMemArena = false;
+            sessionOptions.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
+            sessionOptions.InterOpNumThreads = 1;
+            sessionOptions.IntraOpNumThreads = 1;
+
+            // Enable FP16 execution
             sessionOptions.AppendExecutionProvider_CUDA();
+            
+            // Set provider options after adding the provider
+            sessionOptions.AddSessionConfigEntry("session.use_fp16", "1");
+            
             _inferenceSession = new InferenceSession(_modelPath, sessionOptions);
         }
 
