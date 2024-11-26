@@ -424,82 +424,94 @@ namespace BingLing.Yolov5Onnx.Gpu
             return new DetectionResult(processedImage, outputs);
         }
 
-        private ConcurrentDictionary<int, List<Prediction>> ProcessResults(float[] resultsArray, float proportion_x, float proportion_y)
+        private ConcurrentDictionary<int, List<Prediction>> ProcessResults(float[] resultsArray, float proportionX, float proportionY)
         {
             var dictionary = new ConcurrentDictionary<int, List<Prediction>>();
-            int[] output_dimensions = inference_session!.OutputMetadata[inference_session!.OutputNames[0]].Dimensions;
+            var outputDimensions = inference_session!.OutputMetadata[inference_session!.OutputNames[0]].Dimensions;
 
-            int length_of_predict = output_dimensions[1];
-            int count_of_kind = output_dimensions[2] - 5;
-            //解析输出并过滤掉低置信度的预测结果
-            Parallel.For(0, length_of_predict, i =>
+            var lengthOfPredict = outputDimensions[1];
+            var countOfKind = outputDimensions[2] - 5;
+
+            // 解析输出并过滤掉低置信度的预测结果
+            Parallel.For(0, lengthOfPredict, i =>
             {
-                int j = i * (count_of_kind + 5);
-                float confidence = resultsArray[j + 4];
+                int baseIndex = i * (countOfKind + 5);
+                float confidence = resultsArray[baseIndex + 4];
+                
                 if (confidence >= this.confidence)
                 {
-                    int kind = j + 5;
-                    for (int k = kind + 1; k < j + count_of_kind + 5; k++)
+                    // 找到最大置信度的类别
+                    float maxClassScore = float.MinValue;
+                    int predictedClass = 0;
+                    
+                    for (int j = 0; j < countOfKind; j++)
                     {
-                        if (resultsArray[k] > resultsArray[kind])
+                        float classScore = resultsArray[baseIndex + 5 + j];
+                        if (classScore > maxClassScore)
                         {
-                            kind = k;
+                            maxClassScore = classScore;
+                            predictedClass = j;
                         }
                     }
-                    kind = kind % (count_of_kind + 5) - 5;
 
-                    if (!dictionary.ContainsKey(kind))
-                    {
-                        dictionary.TryAdd(kind, new List<Prediction>());
-                    }
-                    lock (dictionary[kind])
-                    {
-                        dictionary[kind].Add(new Prediction(kind, resultsArray[j], resultsArray[j + 1], resultsArray[j + 2], resultsArray[j + 3], confidence));
-                    }
+                    // 创建预测对象
+                    var prediction = new Prediction(
+                        predictedClass,
+                        resultsArray[baseIndex],     // x
+                        resultsArray[baseIndex + 1], // y
+                        resultsArray[baseIndex + 2], // width
+                        resultsArray[baseIndex + 3], // height
+                        confidence * maxClassScore    // 最终置信度是目标置信度和类别置信度的乘积
+                    );
+
+                    dictionary.AddOrUpdate(
+                        predictedClass,
+                        _ => new List<Prediction> { prediction },
+                        (_, list) =>
+                        {
+                            lock (list)
+                            {
+                                list.Add(prediction);
+                            }
+                            return list;
+                        }
+                    );
                 }
             });
 
-            //NMS算法[同一种预测类别且交并比大于设定阈值的两个预测结果视为同一个目标]，去除针对同一目标的多余预测结果
-            List<int> kinds = new List<int>(dictionary.Keys);
+            // NMS处理
+            var kinds = dictionary.Keys.ToList();
             Parallel.ForEach(kinds, kind =>
             {
-                List<Prediction> predictions = dictionary[kind];
+                var predictions = dictionary[kind];
                 predictions.Sort();
 
-                HashSet<Prediction> hashSet = new HashSet<Prediction>();
+                var toRemove = new HashSet<Prediction>();
                 for (int i = 0; i < predictions.Count; i++)
                 {
-                    if (hashSet.Contains(predictions[i]))
-                    {
-                        continue;
-                    }
+                    if (toRemove.Contains(predictions[i])) continue;
+                    
                     for (int j = i + 1; j < predictions.Count; j++)
                     {
-                        if (hashSet.Contains(predictions[j]))
-                        {
-                            continue;
-                        }
-
+                        if (toRemove.Contains(predictions[j])) continue;
+                        
                         if (predictions[i].IOU(predictions[j]) >= iou)
                         {
-                            hashSet.Add(predictions[j]);
+                            toRemove.Add(predictions[j]);
                         }
                     }
                 }
 
-                foreach (var item in hashSet)
-                {
-                    predictions.Remove(item);
-                }
+                predictions.RemoveAll(p => toRemove.Contains(p));
 
-                //根据比例缩放回来
-                Parallel.ForEach(predictions, prediction =>
+                // 缩放回原始图像尺寸
+                foreach (var pred in predictions)
                 {
-                    prediction.X *= proportion_x;
-                    prediction.Y *= proportion_y;
-                    prediction.Width *= proportion_x;
-                    prediction.Height *= proportion_y;
-                });
+                    pred.X *= proportionX;
+                    pred.Y *= proportionY;
+                    pred.Width *= proportionX;
+                    pred.Height *= proportionY;
+                }
             });
 
             return dictionary;

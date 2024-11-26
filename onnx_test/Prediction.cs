@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -9,43 +9,53 @@ namespace BingLing.Yolov5Onnx.Gpu
     /// <summary>
     /// 预测结果，实现IComparable接口，使得其内部具备置信度从大到小排序的能力
     /// </summary>
-    public class Prediction(int kind, float x, float y, float width, float height, float confidense) : IComparable<Prediction>
+    public class Prediction : IComparable<Prediction>
     {
 
         /// <summary>
         /// 预测结果种类
         /// </summary>
-        public int Kind { set; get; } = kind;
+        public int Kind { get; private set; }
 
         /// <summary>
         /// 预测结果中心横坐标
         /// </summary>
-        public float X { set; get; } = x;
+        public float X { get; set; }
 
         /// <summary>
         /// 预测结果中心纵坐标
         /// </summary>
-        public float Y { set; get; } = y;
+        public float Y { get; set; }
 
         /// <summary>
         /// 预测结果宽度
         /// </summary>
-        public float Width { set; get; } = width;
+        public float Width { get; set; }
 
         /// <summary>
         /// 预测结果高度
         /// </summary>
-        public float Height { set; get; } = height;
+        public float Height { get; set; }
 
         /// <summary>
         /// 预测结果置信度
         /// </summary>
-        public float Confidence { set; get; } = confidense;
+        public float Confidence { get; private set; }
 
         /// <summary>
         /// 避免频繁乘法运算而设的属性
         /// </summary>
-        public float Area { set; get; } = width * height;
+        public float Area => Width * Height;
+
+        public Prediction(int kind, float x, float y, float width, float height, float confidence)
+        {
+            Kind = kind;
+            X = x;
+            Y = y;
+            Width = width;
+            Height = height;
+            Confidence = confidence;
+        }
 
         /// <summary>
         /// 比较规则
@@ -54,11 +64,8 @@ namespace BingLing.Yolov5Onnx.Gpu
         /// <returns></returns>
         public int CompareTo(Prediction? other)
         {
-            if (Confidence > other!.Confidence)
-            {
-                return -1;
-            }
-            return 1;
+            if (other is null) return 1;
+            return other.Confidence.CompareTo(Confidence); // 从大到小排序
         }
 
         /// <summary>
@@ -70,17 +77,11 @@ namespace BingLing.Yolov5Onnx.Gpu
         {
             float minX = Math.Max(X - Width / 2, other.X - other.Width / 2);
             float maxX = Math.Min(X + Width / 2, other.X + other.Width / 2);
-            if (maxX < minX)
-            {
-                return 0;
-            }
+            if (maxX < minX) return 0;
 
             float minY = Math.Max(Y - Height / 2, other.Y - other.Height / 2);
             float maxY = Math.Min(Y + Height / 2, other.Y + other.Height / 2);
-            if (maxY < minY)
-            {
-                return 0;
-            }
+            if (maxY < minY) return 0;
 
             float intersection = (maxX - minX) * (maxY - minY);
             float union = Area + other.Area - intersection;
