@@ -2,7 +2,7 @@
   "profiles": {
     "onnx_test": {
       "commandName": "Project",
-      "commandLineArgs": "stream5 yolov5_onnx.json"
+      "commandLineArgs": "stream5 models/yolov5_onnx.json"
     }
   }
 }

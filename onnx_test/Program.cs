@@ -55,7 +55,7 @@ namespace TestNugetCpuOnnx
                 }
 
                 // 预分配可重用的 Mat
-                using (var frame = new Mat(480, 640, DepthType.Cv8U, 3))
+                using (var frame = new Mat(640, 640, DepthType.Cv8U, 3))
                 using (var dataSender = new DataSender(streamName))
                 {
 
@@ -77,7 +77,7 @@ namespace TestNugetCpuOnnx
                         if (status == "offline")
                         {
                             Console.WriteLine($"Stream {streamName} is offline. Waiting...");
-                            await Task.Delay(5000);
+                            await Task.Delay(1000);
                         }
 
                         if (status != "offline")
@@ -102,6 +102,7 @@ namespace TestNugetCpuOnnx
 
                                     try
                                     {
+                                        var frameProcessingStopwatch = Stopwatch.StartNew();
                                         Marshal.Copy(imageBytes, 0, frame.DataPointer, imageBytes.Length);
                                         if (!frame.IsEmpty)
                                         {
@@ -131,7 +132,7 @@ namespace TestNugetCpuOnnx
                                                     // 只有当检测到物体时才发送数据到队列
                                                     if (detections.Length > 0 && dataSender != null)
                                                     {
-                                                        dataSender.ProcessBox(streamName, detections, processedImage);
+                                                       await dataSender.ProcessBox(streamName, detections, processedImage);
 
                                                         Console.WriteLine($"检测到的物体数量: {detections.GetLength(0)}");
 
@@ -153,11 +154,9 @@ namespace TestNugetCpuOnnx
                                                     }
                                                 }
                                             }
-
-                                            // 显示处理后的图片
-                                            // CvInvoke.Imshow("Processed Frame", processedImage);
-                                            // CvInvoke.WaitKey(1);
                                         }
+                                        frameProcessingStopwatch.Stop();
+                                        Console.WriteLine($"帧处理总耗时: {frameProcessingStopwatch.ElapsedMilliseconds}毫秒");
                                     }
                                     catch (Exception ex)
                                     {
