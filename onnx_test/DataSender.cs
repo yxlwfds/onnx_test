@@ -8,6 +8,8 @@ using Emgu.CV.Util;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.PixelFormats;
+using onnx_test.Utils;
+using System.Runtime.InteropServices;
 
 namespace onnx_test
 {
@@ -16,112 +18,100 @@ namespace onnx_test
         private readonly string _streamName;
         private readonly IDatabase _redisDb;
         private bool _disposed;
+        private readonly SixLabors.ImageSharp.Formats.Jpeg.JpegEncoder _jpegEncoder;
 
         public DataSender(string streamName)
         {
             _streamName = streamName;
             _redisDb = RedisConnectionManager.Instance.GetDatabase();
+            _jpegEncoder = new SixLabors.ImageSharp.Formats.Jpeg.JpegEncoder
+            {
+                Quality = 80,
+                Interleaved = true
+            };
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!_disposed)
+            {
+                if (disposing)
+                {
+                    // 释放托管资源
+                    // JpegEncoder from ImageSharp doesn't require explicit disposal
+                }
+                _disposed = true;
+            }
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        ~DataSender()
+        {
+            Dispose(false);
         }
 
         public async Task ProcessBox(string id, float[,] detectionBox, Mat processedImage)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(processedImage);
+            
             var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
             var stepStopwatch = new System.Diagnostics.Stopwatch();
+
+            // 从内存池租用数组和流
+            byte[] rawData = null;
+            byte[] imageBytes = null;
+            MemoryStream encoderStream = null;
+            MemoryStream base64Stream = null;
 
             try
             {
                 stepStopwatch.Restart();
-                // Convert detection box to list format
-                var boxList = new List<List<float>>();
-                int rows = detectionBox.GetLength(0);
-                int cols = detectionBox.GetLength(1);
-                for (int i = 0; i < rows; i++)
-                {
-                    var row = new List<float>();
-                    for (int j = 0; j < cols; j++)
-                    {
-                        row.Add(detectionBox[i, j]);
-                    }
-                    boxList.Add(row);
-                }
+                var boxList = ProcessDetectionBox(detectionBox);
                 Console.WriteLine($"[性能日志] 数据结构转换耗时: {stepStopwatch.ElapsedMilliseconds}ms");
 
-                // Encode image to JPEG bytes
+                // 图像编码
                 stepStopwatch.Restart();
-                byte[] imageBytes;
                 
-                // 从Mat获取原始图像数据并立即释放
-                byte[] rawData;
-                using (var matData = processedImage.GetUMat(Emgu.CV.CvEnum.AccessType.Read))
+                // 计算所需的缓冲区大小
+                int bufferSize = processedImage.Height * processedImage.Width * processedImage.NumberOfChannels;
+                rawData = ImageArrayPool.Instance.RentArray(bufferSize);
+
+                // 直接从Mat获取数据，避免额外的复制
+                if (processedImage.IsContinuous)
                 {
-                    rawData = new byte[processedImage.Height * processedImage.Width * processedImage.NumberOfChannels];
+                    Marshal.Copy(processedImage.DataPointer, rawData, 0, bufferSize);
+                }
+                else
+                {
+                    using var matData = processedImage.GetUMat(AccessType.Read);
                     matData.CopyTo(rawData);
                 }
 
-                // 使用ImageSharp进行高性能编码，确保所有资源都被释放
+                // 使用内存池中的流进行编码
+                encoderStream = ImageArrayPool.Instance.RentStream();
                 using (var image = Image.LoadPixelData<Rgb24>(rawData, processedImage.Width, processedImage.Height))
-                using (var ms = new MemoryStream())
                 {
-                    var encoder = new JpegEncoder
-                    {
-                        Quality = 80,
-                        Interleaved = true
-                    };
-                    
-                    image.Save(ms, encoder);
-                    imageBytes = ms.ToArray();
+                    await image.SaveAsync(encoderStream, _jpegEncoder);
+                    imageBytes = new byte[encoderStream.Position];
+                    encoderStream.Position = 0;
+                    await encoderStream.ReadAsync(imageBytes);
                 }
-                
-                // 清理不再需要的数据
-                Array.Clear(rawData, 0, rawData.Length);
-                rawData = null;
                 
                 Console.WriteLine($"[性能日志] 图像编码耗时: {stepStopwatch.ElapsedMilliseconds}ms");
                 Console.WriteLine($"[性能日志] 图像大小: {imageBytes.Length / 1024.0:F2}KB");
 
-                // Send data to Redis with retry
+                // 发送数据到Redis
                 await ProcessDataWithRetry(async () =>
                 {
-                    stepStopwatch.Restart();
-                    // Send image to Redis stream
-                    var streamEntries = new NameValueEntry[]
-                    {
-                        new("frame", imageBytes),
-                        new("timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString())
-                    };
-                    await _redisDb.StreamAddAsync(_streamName, streamEntries, maxLength: 50);
-                    Console.WriteLine($"[性能日志] Redis Stream写入耗时: {stepStopwatch.ElapsedMilliseconds}ms");
-
-                    stepStopwatch.Restart();
-                    // Send detection results and convert to Base64 in chunks to reduce memory usage
-                    using (var ms = new MemoryStream())
-                    {
-                        var writer = new StreamWriter(ms);
-                        writer.Write(Convert.ToBase64String(imageBytes));
-                        writer.Flush();
-                        ms.Position = 0;
-                        
-                        var dataOut = new
-                        {
-                            id = id,
-                            res = JsonSerializer.Serialize(boxList),
-                            image = new StreamReader(ms).ReadToEnd()
-                        };
-                        Console.WriteLine($"[性能日志] Base64编码耗时: {stepStopwatch.ElapsedMilliseconds}ms");
-
-                        stepStopwatch.Restart();
-                        string jsonData = JsonSerializer.Serialize(dataOut);
-                        Console.WriteLine(dataOut.res);
-                        await _redisDb.ListLeftPushAsync("box_data_queue", jsonData);
-                        await _redisDb.ListTrimAsync("box_data_queue", 0, 1000);
-                        Console.WriteLine($"[性能日志] Redis List操作耗时: {stepStopwatch.ElapsedMilliseconds}ms");
-                    }
+                    await SendToRedisStream(imageBytes, stepStopwatch);
+                    await SendToRedisList(id, boxList, imageBytes, stepStopwatch);
                 });
-
-                // 清理图像数据
-                Array.Clear(imageBytes, 0, imageBytes.Length);
-                imageBytes = null;
 
                 totalStopwatch.Stop();
                 Console.WriteLine($"[性能日志] ProcessBox总耗时: {totalStopwatch.ElapsedMilliseconds}ms");
@@ -133,10 +123,65 @@ namespace onnx_test
             }
             finally
             {
-                // 确保在发生异常时也能清理资源
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
+                // 归还所有租用的资源
+                if (rawData != null) ImageArrayPool.Instance.ReturnArray(rawData);
+                if (encoderStream != null) ImageArrayPool.Instance.ReturnStream(encoderStream);
+                if (base64Stream != null) ImageArrayPool.Instance.ReturnStream(base64Stream);
             }
+        }
+
+        private List<List<float>> ProcessDetectionBox(float[,] detectionBox)
+        {
+            var boxList = new List<List<float>>();
+            int rows = detectionBox.GetLength(0);
+            int cols = detectionBox.GetLength(1);
+            
+            for (int i = 0; i < rows; i++)
+            {
+                var row = new List<float>(cols);
+                for (int j = 0; j < cols; j++)
+                {
+                    row.Add(detectionBox[i, j]);
+                }
+                boxList.Add(row);
+            }
+            return boxList;
+        }
+
+        private async Task SendToRedisStream(byte[] imageBytes, System.Diagnostics.Stopwatch stepStopwatch)
+        {
+            stepStopwatch.Restart();
+            var streamEntries = new NameValueEntry[]
+            {
+                new("frame", imageBytes),
+                new("timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString())
+            };
+            await _redisDb.StreamAddAsync(_streamName, streamEntries, maxLength: 50);
+            Console.WriteLine($"[性能日志] Redis Stream写入耗时: {stepStopwatch.ElapsedMilliseconds}ms");
+        }
+
+        private async Task SendToRedisList(string id, List<List<float>> boxList, byte[] imageBytes, System.Diagnostics.Stopwatch stepStopwatch)
+        {
+            stepStopwatch.Restart();
+            using var base64Stream = ImageArrayPool.Instance.RentStream();
+            using (var writer = new StreamWriter(base64Stream, leaveOpen: true))
+            {
+                writer.Write(Convert.ToBase64String(imageBytes));
+                writer.Flush();
+                base64Stream.Position = 0;
+                
+                var dataOut = new
+                {
+                    id = id,
+                    res = JsonSerializer.Serialize(boxList),
+                    image = new StreamReader(base64Stream).ReadToEnd()
+                };
+
+                string jsonData = JsonSerializer.Serialize(dataOut);
+                await _redisDb.ListLeftPushAsync("box_data_queue", jsonData);
+                await _redisDb.ListTrimAsync("box_data_queue", 0, 1000);
+            }
+            Console.WriteLine($"[性能日志] Redis操作耗时: {stepStopwatch.ElapsedMilliseconds}ms");
         }
 
         private static async Task ProcessDataWithRetry(Func<Task> action, int maxRetries = 3)
@@ -153,15 +198,6 @@ namespace onnx_test
                     if (i == maxRetries - 1) throw;
                     await Task.Delay(1000 * (i + 1));
                 }
-            }
-        }
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                _disposed = true;
-                GC.SuppressFinalize(this);
             }
         }
     }
