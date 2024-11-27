@@ -44,7 +44,7 @@ namespace TestNugetCpuOnnx
 
             try
             {
-                ApplicationLogger.Instance.Info("配置文件路径:" + configPath);
+                ApplicationLogger.Instance.Info($"{streamName}配置文件路径:{configPath}");
 
                 // Initialize model and GPU resources
                 ModelManager.Initialize(configPath);
