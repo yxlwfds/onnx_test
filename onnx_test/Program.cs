@@ -23,7 +23,7 @@ namespace TestNugetCpuOnnx
             Directory.CreateDirectory(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs"));
             
             // 加载NLog配置
-            LogManager.LoadConfiguration("nlog.config");
+            LogManager.Setup().LoadConfigurationFromFile("nlog.config");
             
             if (args.Length != 2)
             {
