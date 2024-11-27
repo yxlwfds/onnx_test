@@ -58,7 +58,6 @@ namespace TestNugetCpuOnnx
                 using (var frame = new Mat(480, 640, DepthType.Cv8U, 3))
                 using (var dataSender = new DataSender(streamName))
                 {
-                    dataSender.StartBoxService();
 
                     Console.WriteLine("开始从Redis流中读取帧...");
                     while (true)
@@ -132,7 +131,7 @@ namespace TestNugetCpuOnnx
                                                     // 只有当检测到物体时才发送数据到队列
                                                     if (detections.Length > 0 && dataSender != null)
                                                     {
-                                                        // dataSender.ProcessBox(streamName, detections, processedImage);
+                                                        dataSender.ProcessBox(streamName, detections, processedImage);
 
                                                         Console.WriteLine($"检测到的物体数量: {detections.GetLength(0)}");
 
