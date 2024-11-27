@@ -143,7 +143,7 @@ class Service:
                             last_heartbeat = now
                         s_i = s_i + 1
                         out_img, num_box = dectonnx.detectBox(model, raw_frame, filename)  # 检测
-                        # if len(num_box) > 0:
+                        if len(num_box) > 0:
                             # if save:
                             #     # 保存图片
                             #     # 不再直接保存图片，而是将图片base64后推送到 Redis Stream
@@ -152,7 +152,7 @@ class Service:
                             #     # 限制队列长度为10
                             #     r.ltrim(f"frame_base64", 0, 100)
                             #     save = False
-                            # self.process_box(d, num_box, out_img)
+                            self.process_box(d, num_box, out_img)
                         # else:
                         #     if s_i == 1:  # 当检测框为空时，每隔5帧保存一张图片
                         #         save = True

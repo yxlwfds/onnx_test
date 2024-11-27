@@ -73,7 +73,7 @@ namespace BingLing.Yolov5Onnx.Gpu
             }
         }
 
-        private readonly InferenceSession? inference_session;
+        private InferenceSession? inference_session;
 
         /// <summary>
         /// 推理会话，隶属于OnnxRuntime官方类，有关介绍请到官网查询
@@ -160,102 +160,116 @@ namespace BingLing.Yolov5Onnx.Gpu
         /// <returns>预测结果，包含处理后的图像和检测框数据</returns>
         public DetectionResult DetectLetItRot(Mat mat)
         {
+            ThrowIfDisposed();
+            
             float proportion_x = 1f * mat.Width / _modelInputSize.Width;
             float proportion_y = 1f * mat.Height / _modelInputSize.Height;
 
-            // 使用预分配的Mat进行resize并克隆原图用于绘制
-            Mat processedImage = mat.Clone();
-            CvInvoke.Resize(mat, _resizedMat, _modelInputSize);
-
-            lock (_bufferLock)
+            Mat processedImage = null;
+            try
             {
-                Marshal.Copy(_resizedMat.DataPointer, _imageBuffer, 0, _imageBuffer.Length);
+                processedImage = mat.Clone();
+                CvInvoke.Resize(mat, _resizedMat, _modelInputSize);
 
-                // 使用SIMD优化的并行处理
-                int pixelCount = _modelInputSize.Width * _modelInputSize.Height;
-                int vectorSize = 4;
-                int remainingStart = (pixelCount / vectorSize) * vectorSize;
-
-                Parallel.For(0, pixelCount / vectorSize, i =>
+                lock (_bufferLock)
                 {
-                    int baseIdx = i * vectorSize * 3;
-                    for (int j = 0; j < vectorSize; j++)
+                    Marshal.Copy(_resizedMat.DataPointer, _imageBuffer, 0, _imageBuffer.Length);
+
+                    // 使用SIMD优化的并行处理
+                    int pixelCount = _modelInputSize.Width * _modelInputSize.Height;
+                    int vectorSize = 4;
+                    int remainingStart = (pixelCount / vectorSize) * vectorSize;
+
+                    Parallel.For(0, pixelCount / vectorSize, i =>
                     {
-                        int pixelIdx = i * vectorSize + j;
-                        int row = pixelIdx / _modelInputSize.Width;
-                        int col = pixelIdx % _modelInputSize.Width;
-                        int srcIdx = baseIdx + j * 3;
+                        int baseIdx = i * vectorSize * 3;
+                        for (int j = 0; j < vectorSize; j++)
+                        {
+                            int pixelIdx = i * vectorSize + j;
+                            int row = pixelIdx / _modelInputSize.Width;
+                            int col = pixelIdx % _modelInputSize.Width;
+                            int srcIdx = baseIdx + j * 3;
+
+                            _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx] / 255f;
+                            _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f;
+                            _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx + 2] / 255f;
+                        }
+                    });
+
+                    for (int i = remainingStart; i < pixelCount; i++)
+                    {
+                        int row = i / _modelInputSize.Width;
+                        int col = i % _modelInputSize.Width;
+                        int srcIdx = i * 3;
 
                         _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx] / 255f;
                         _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f;
                         _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx + 2] / 255f;
                     }
-                });
 
-                for (int i = remainingStart; i < pixelCount; i++)
-                {
-                    int row = i / _modelInputSize.Width;
-                    int col = i % _modelInputSize.Width;
-                    int srcIdx = i * 3;
-
-                    _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx] / 255f;
-                    _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f;
-                    _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx + 2] / 255f;
-                }
-
-                var inputs = new List<NamedOnnxValue>
-                {
-                    NamedOnnxValue.CreateFromTensor(_inputMetadataName, _reuseInputTensor)
-                };
-
-                using var values = inference_session.Run(inputs);
-                float[] result = values.First(value => value.Name == _outputMetadataName).AsEnumerable<float>().ToArray();
-
-                var predictions = ProcessPredictions(result, proportion_x, proportion_y);
-                
-                // Draw boxes on the image
-                foreach (var kvp in predictions)
-                {
-                    foreach (var pred in kvp.Value)
+                    var inputs = new List<NamedOnnxValue>
                     {
-                        var rect = new Rectangle(
-                            (int)pred.X,
-                            (int)pred.Y,
-                            (int)pred.Width,
-                            (int)pred.Height
-                        );
-                        CvInvoke.Rectangle(processedImage, rect, new MCvScalar(0, 255, 0), 2);
-                        CvInvoke.PutText(processedImage, 
-                            $"{kvp.Key} {pred.Confidence:F2}", 
-                            new Point((int)pred.X, (int)pred.Y - 10),
-                            FontFace.HersheyTriplex,
-                            0.8,
-                            new MCvScalar(255, 0, 0),
-                            1,
-                            LineType.AntiAlias);
-                    }
-                }
+                        NamedOnnxValue.CreateFromTensor(_inputMetadataName, _reuseInputTensor)
+                    };
 
-                // Convert predictions to output format similar to Python
-                int totalPredictions = predictions.Sum(p => p.Value.Count);
-                var outputs = new float[totalPredictions, 6];
-                int idx = 0;
-                foreach (var kvp in predictions)
-                {
-                    foreach (var pred in kvp.Value)
+                    using var values = inference_session.Run(inputs);
+                    float[] result = values.First(value => value.Name == _outputMetadataName).AsEnumerable<float>().ToArray();
+
+                    var predictions = ProcessPredictions(result, proportion_x, proportion_y);
+                    
+                    // Draw boxes on the image
+                    foreach (var kvp in predictions)
                     {
-                        outputs[idx, 0] = pred.X;
-                        outputs[idx, 1] = pred.Y;
-                        outputs[idx, 2] = pred.X + pred.Width;
-                        outputs[idx, 3] = pred.Y + pred.Height;
-                        outputs[idx, 4] = pred.Confidence;
-                        outputs[idx, 5] = kvp.Key;
-                        idx++;
+                        foreach (var pred in kvp.Value)
+                        {
+                            var rect = new Rectangle(
+                                (int)pred.X,
+                                (int)pred.Y,
+                                (int)pred.Width,
+                                (int)pred.Height
+                            );
+                            CvInvoke.Rectangle(processedImage, rect, new MCvScalar(0, 255, 0), 2);
+                            CvInvoke.PutText(processedImage, 
+                                $"{kvp.Key} {pred.Confidence:F2}", 
+                                new Point((int)pred.X, (int)pred.Y - 10),
+                                FontFace.HersheyTriplex,
+                                0.8,
+                                new MCvScalar(255, 0, 0),
+                                1,
+                                LineType.AntiAlias);
+                        }
                     }
-                }
 
-                return new DetectionResult(processedImage, outputs);
+                    var outputs = ConvertPredictionsToOutput(predictions);
+                    return new DetectionResult(processedImage, outputs);
+                }
             }
+            catch (Exception)
+            {
+                processedImage?.Dispose();
+                throw;
+            }
+        }
+
+        private float[,] ConvertPredictionsToOutput(ConcurrentDictionary<int, List<Prediction>> predictions)
+        {
+            int totalPredictions = predictions.Sum(p => p.Value.Count);
+            var outputs = new float[totalPredictions, 6];
+            int idx = 0;
+            foreach (var kvp in predictions)
+            {
+                foreach (var pred in kvp.Value)
+                {
+                    outputs[idx, 0] = pred.X;
+                    outputs[idx, 1] = pred.Y;
+                    outputs[idx, 2] = pred.X + pred.Width;
+                    outputs[idx, 3] = pred.Y + pred.Height;
+                    outputs[idx, 4] = pred.Confidence;
+                    outputs[idx, 5] = kvp.Key;
+                    idx++;
+                }
+            }
+            return outputs;
         }
 
         private ConcurrentDictionary<int, List<Prediction>> ProcessPredictions(float[] result, float proportion_x, float proportion_y)
@@ -541,14 +555,17 @@ namespace BingLing.Yolov5Onnx.Gpu
             {
                 if (disposing)
                 {
-                    // Dispose managed resources
+                    _resizedMat?.Dispose();
                     _reuseInputTensor = null;
                     _imageBuffer = null;
                     _processingBuffer = null;
-                    _resizedMat?.Dispose();
-                    _resizedMat = null;
+                    
+                    // Don't dispose inference_session here as it's managed by ModelManager
+                    inference_session = null;
+                    
+                    // Clear any other managed resources
+                    yolo_onnx_path = null;
                 }
-
                 _disposed = true;
             }
         }
@@ -556,6 +573,14 @@ namespace BingLing.Yolov5Onnx.Gpu
         ~Yolov5Onnx()
         {
             Dispose(false);
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(Yolov5Onnx));
+            }
         }
     }
 }
