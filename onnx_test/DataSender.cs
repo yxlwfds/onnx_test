@@ -51,26 +51,31 @@ namespace onnx_test
                 stepStopwatch.Restart();
                 byte[] imageBytes;
                 
-                // 从Mat获取原始图像数据
-                using var matData = processedImage.GetUMat(Emgu.CV.CvEnum.AccessType.Read);
-                byte[] rawData = new byte[processedImage.Height * processedImage.Width * processedImage.NumberOfChannels];
-                matData.CopyTo(rawData);
+                // 从Mat获取原始图像数据并立即释放
+                byte[] rawData;
+                using (var matData = processedImage.GetUMat(Emgu.CV.CvEnum.AccessType.Read))
+                {
+                    rawData = new byte[processedImage.Height * processedImage.Width * processedImage.NumberOfChannels];
+                    matData.CopyTo(rawData);
+                }
 
-                // 使用ImageSharp进行高性能编码
+                // 使用ImageSharp进行高性能编码，确保所有资源都被释放
                 using (var image = Image.LoadPixelData<Rgb24>(rawData, processedImage.Width, processedImage.Height))
                 using (var ms = new MemoryStream())
                 {
-                    // 配置JPEG编码器以获得最佳性能
                     var encoder = new JpegEncoder
                     {
-                        Quality = 80,  // 0-100
-                        Interleaved = true  // 启用交错编码以提高性能
-                        // 移除 OptimizeEncoding，因为最新版本不再需要此属性
+                        Quality = 80,
+                        Interleaved = true
                     };
                     
                     image.Save(ms, encoder);
                     imageBytes = ms.ToArray();
                 }
+                
+                // 清理不再需要的数据
+                Array.Clear(rawData, 0, rawData.Length);
+                rawData = null;
                 
                 Console.WriteLine($"[性能日志] 图像编码耗时: {stepStopwatch.ElapsedMilliseconds}ms");
                 Console.WriteLine($"[性能日志] 图像大小: {imageBytes.Length / 1024.0:F2}KB");
@@ -89,23 +94,34 @@ namespace onnx_test
                     Console.WriteLine($"[性能日志] Redis Stream写入耗时: {stepStopwatch.ElapsedMilliseconds}ms");
 
                     stepStopwatch.Restart();
-                    // Send detection results
-                    string imgBase64 = Convert.ToBase64String(imageBytes);
-                    var dataOut = new
+                    // Send detection results and convert to Base64 in chunks to reduce memory usage
+                    using (var ms = new MemoryStream())
                     {
-                        id = id,
-                        res = JsonSerializer.Serialize(boxList),
-                        image = imgBase64
-                    };
-                    Console.WriteLine($"[性能日志] Base64编码耗时: {stepStopwatch.ElapsedMilliseconds}ms");
+                        var writer = new StreamWriter(ms);
+                        writer.Write(Convert.ToBase64String(imageBytes));
+                        writer.Flush();
+                        ms.Position = 0;
+                        
+                        var dataOut = new
+                        {
+                            id = id,
+                            res = JsonSerializer.Serialize(boxList),
+                            image = new StreamReader(ms).ReadToEnd()
+                        };
+                        Console.WriteLine($"[性能日志] Base64编码耗时: {stepStopwatch.ElapsedMilliseconds}ms");
 
-                    stepStopwatch.Restart();
-                    string jsonData = JsonSerializer.Serialize(dataOut);
-                    Console.WriteLine(dataOut.res);
-                    await _redisDb.ListLeftPushAsync("box_data_queue", jsonData);
-                    await _redisDb.ListTrimAsync("box_data_queue", 0, 1000);
-                    Console.WriteLine($"[性能日志] Redis List操作耗时: {stepStopwatch.ElapsedMilliseconds}ms");
+                        stepStopwatch.Restart();
+                        string jsonData = JsonSerializer.Serialize(dataOut);
+                        Console.WriteLine(dataOut.res);
+                        await _redisDb.ListLeftPushAsync("box_data_queue", jsonData);
+                        await _redisDb.ListTrimAsync("box_data_queue", 0, 1000);
+                        Console.WriteLine($"[性能日志] Redis List操作耗时: {stepStopwatch.ElapsedMilliseconds}ms");
+                    }
                 });
+
+                // 清理图像数据
+                Array.Clear(imageBytes, 0, imageBytes.Length);
+                imageBytes = null;
 
                 totalStopwatch.Stop();
                 Console.WriteLine($"[性能日志] ProcessBox总耗时: {totalStopwatch.ElapsedMilliseconds}ms");
@@ -114,6 +130,12 @@ namespace onnx_test
             {
                 Console.WriteLine($"Error in ProcessBox: {ex.Message}");
                 throw;
+            }
+            finally
+            {
+                // 确保在发生异常时也能清理资源
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
             }
         }
 
