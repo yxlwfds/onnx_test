@@ -153,6 +153,110 @@ namespace BingLing.Yolov5Onnx.Gpu
             _reuseInputTensor = new DenseTensor<float>(dimensions);
         }
 
+        private Mat LetterboxImage(Mat img, Size newShape, Color color, bool auto = true, bool scaleFill = false, bool scaleup = true)
+        {
+            float ratio = Math.Min((float)newShape.Width / img.Width, (float)newShape.Height / img.Height);
+            if (!scaleup)
+                ratio = Math.Min(ratio, 1.0f);
+
+            int newUnpad = (int)Math.Round(img.Width * ratio), newUnpadH = (int)Math.Round(img.Height * ratio);
+            int dw = newShape.Width - newUnpad;
+            int dh = newShape.Height - newUnpadH;
+
+            if (auto)
+            {
+                dw %= 32;
+                dh %= 32;
+            }
+
+            var resized = new Mat();
+            CvInvoke.Resize(img, resized, new Size(newUnpad, newUnpadH));
+
+            int top = dh / 2;
+            int bottom = dh - (dh / 2);
+            int left = dw / 2;
+            int right = dw - (dw / 2);
+
+            var padded = new Mat();
+            CvInvoke.CopyMakeBorder(resized, padded, top, bottom, left, right, BorderType.Constant, new MCvScalar(color.B, color.G, color.R));
+            resized.Dispose();
+
+            return padded;
+        }
+
+        private ConcurrentDictionary<int, List<Prediction>> ProcessPredictions(float[] result, float proportion_x, float proportion_y, bool agnostic = false)
+        {
+            var dictionary = new ConcurrentDictionary<int, List<Prediction>>();
+
+            // 使用并行处理预测结果
+            Parallel.For(0, _lengthOfPredict, i =>
+            {
+                int j = i * (_countOfKind + 5);
+                float confidence = result[j + 4];
+                if (confidence >= this.confidence)
+                {
+                    int kind = j + 5;
+                    for (int k = kind + 1; k < j + _countOfKind + 5; k++)
+                    {
+                        if (result[k] > result[kind])
+                        {
+                            kind = k;
+                        }
+                    }
+                    kind = kind % (_countOfKind + 5) - 5;
+
+                    dictionary.AddOrUpdate(agnostic ? 0 : kind,
+                        _ => new List<Prediction> { new(kind, result[j], result[j + 1], result[j + 2], result[j + 3], confidence) },
+                        (_, list) =>
+                        {
+                            lock (list)
+                            {
+                                list.Add(new(kind, result[j], result[j + 1], result[j + 2], result[j + 3], confidence));
+                            }
+                            return list;
+                        });
+                }
+            });
+
+            // 并行处理NMS
+            Parallel.ForEach(dictionary.Keys, key =>
+            {
+                var predictions = dictionary[key];
+                lock (predictions)
+                {
+                    predictions.Sort();
+                    var toRemove = new HashSet<Prediction>();
+
+                    for (int i = 0; i < predictions.Count; i++)
+                    {
+                        if (toRemove.Contains(predictions[i])) continue;
+                        
+                        for (int j = i + 1; j < predictions.Count; j++)
+                        {
+                            if (toRemove.Contains(predictions[j])) continue;
+                            
+                            if (predictions[i].IOU(predictions[j]) >= iou)
+                            {
+                                toRemove.Add(predictions[j]);
+                            }
+                        }
+                    }
+
+                    predictions.RemoveAll(p => toRemove.Contains(p));
+
+                    for (int i = 0; i < predictions.Count; i++)
+                    {
+                        predictions[i].X *= proportion_x;
+                        predictions[i].Y *= proportion_y;
+                        predictions[i].Width *= proportion_x;
+                        predictions[i].Height *= proportion_y;
+                    }
+                }
+            });
+
+            return dictionary;
+        }
+
         /// <summary>
         /// 摆烂进行预测[适用于性能要求不太高的场景]，适当占用CPU
         /// </summary>
@@ -162,49 +266,42 @@ namespace BingLing.Yolov5Onnx.Gpu
         {
             ThrowIfDisposed();
             
-            float proportion_x = 1f * mat.Width / _modelInputSize.Width;
-            float proportion_y = 1f * mat.Height / _modelInputSize.Height;
-
             Mat processedImage = null;
+            Mat letterboxed = null;
             try
             {
                 processedImage = mat.Clone();
-                CvInvoke.Resize(mat, _resizedMat, _modelInputSize);
+                
+                // 使用letterbox预处理
+                letterboxed = LetterboxImage(mat, _modelInputSize, Color.FromArgb(114, 114, 114));
+                
+                // 确保图像是连续的内存布局
+                if (!letterboxed.IsContinuous)
+                {
+                    var temp = letterboxed.Clone();
+                    letterboxed.Dispose();
+                    letterboxed = temp;
+                }
 
                 lock (_bufferLock)
                 {
-                    Marshal.Copy(_resizedMat.DataPointer, _imageBuffer, 0, _imageBuffer.Length);
-
-                    // 使用SIMD优化的并行处理
-                    int pixelCount = _modelInputSize.Width * _modelInputSize.Height;
-                    int vectorSize = 4;
-                    int remainingStart = (pixelCount / vectorSize) * vectorSize;
-
-                    Parallel.For(0, pixelCount / vectorSize, i =>
+                    // 使用更安全的方式复制数据
+                    var imageData = letterboxed.GetData();
+                    if (imageData is byte[,,] bytes)
                     {
-                        int baseIdx = i * vectorSize * 3;
-                        for (int j = 0; j < vectorSize; j++)
+                        // 使用SIMD优化的并行处理
+                        int height = letterboxed.Height;
+                        int width = letterboxed.Width;
+
+                        Parallel.For(0, height, i =>
                         {
-                            int pixelIdx = i * vectorSize + j;
-                            int row = pixelIdx / _modelInputSize.Width;
-                            int col = pixelIdx % _modelInputSize.Width;
-                            int srcIdx = baseIdx + j * 3;
-
-                            _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx] / 255f;
-                            _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f;
-                            _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx + 2] / 255f;
-                        }
-                    });
-
-                    for (int i = remainingStart; i < pixelCount; i++)
-                    {
-                        int row = i / _modelInputSize.Width;
-                        int col = i % _modelInputSize.Width;
-                        int srcIdx = i * 3;
-
-                        _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx] / 255f;
-                        _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f;
-                        _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx + 2] / 255f;
+                            for (int j = 0; j < width; j++)
+                            {
+                                _reuseInputTensor[0, 0, i, j] = bytes[i, j, 0] / 255f;
+                                _reuseInputTensor[0, 1, i, j] = bytes[i, j, 1] / 255f;
+                                _reuseInputTensor[0, 2, i, j] = bytes[i, j, 2] / 255f;
+                            }
+                        });
                     }
 
                     var inputs = new List<NamedOnnxValue>
@@ -215,7 +312,11 @@ namespace BingLing.Yolov5Onnx.Gpu
                     using var values = inference_session.Run(inputs);
                     float[] result = values.First(value => value.Name == _outputMetadataName).AsEnumerable<float>().ToArray();
 
-                    var predictions = ProcessPredictions(result, proportion_x, proportion_y);
+                    // 计算letterbox后的比例
+                    float proportion_x = 1f * mat.Width / letterboxed.Width;
+                    float proportion_y = 1f * mat.Height / letterboxed.Height;
+
+                    var predictions = ProcessPredictions(result, proportion_x, proportion_y, true);
                     
                     // Draw boxes on the image
                     foreach (var kvp in predictions)
@@ -230,7 +331,7 @@ namespace BingLing.Yolov5Onnx.Gpu
                             );
                             CvInvoke.Rectangle(processedImage, rect, new MCvScalar(0, 255, 0), 2);
                             CvInvoke.PutText(processedImage, 
-                                $"{kvp.Key} {pred.Confidence:F2}", 
+                                $"{pred.Kind} {pred.Confidence:F2}", 
                                 new Point((int)pred.X, (int)pred.Y - 10),
                                 FontFace.HersheyTriplex,
                                 0.8,
@@ -247,7 +348,12 @@ namespace BingLing.Yolov5Onnx.Gpu
             catch (Exception)
             {
                 processedImage?.Dispose();
+                letterboxed?.Dispose();
                 throw;
+            }
+            finally
+            {
+                letterboxed?.Dispose();
             }
         }
 
@@ -270,81 +376,6 @@ namespace BingLing.Yolov5Onnx.Gpu
                 }
             }
             return outputs;
-        }
-
-        private ConcurrentDictionary<int, List<Prediction>> ProcessPredictions(float[] result, float proportion_x, float proportion_y)
-        {
-            var dictionary = new ConcurrentDictionary<int, List<Prediction>>();
-
-            // 使用并行处理预测结果
-            Parallel.For(0, _lengthOfPredict, i =>
-            {
-                int j = i * (_countOfKind + 5);
-                float confidence = result[j + 4];
-                if (confidence >= this.confidence)
-                {
-                    int kind = j + 5;
-                    for (int k = kind + 1; k < j + _countOfKind + 5; k++)
-                    {
-                        if (result[k] > result[kind])
-                        {
-                            kind = k;
-                        }
-                    }
-                    kind = kind % (_countOfKind + 5) - 5;
-
-                    dictionary.AddOrUpdate(kind,
-                        _ => new List<Prediction> { new(kind, result[j], result[j + 1], result[j + 2], result[j + 3], confidence) },
-                        (_, list) =>
-                        {
-                            lock (list)
-                            {
-                                list.Add(new(kind, result[j], result[j + 1], result[j + 2], result[j + 3], confidence));
-                            }
-                            return list;
-                        });
-                }
-            });
-
-            // 并行处理NMS
-            Parallel.ForEach(dictionary.Keys, kind =>
-            {
-                var predictions = dictionary[kind];
-                lock (predictions)
-                {
-                    predictions.Sort();
-                    var toRemove = new HashSet<Prediction>();
-
-                    for (int i = 0; i < predictions.Count; i++)
-                    {
-                        if (toRemove.Contains(predictions[i])) continue;
-                        
-                        for (int j = i + 1; j < predictions.Count; j++)
-                        {
-                            if (toRemove.Contains(predictions[j])) continue;
-                            
-                            if (predictions[i].IOU(predictions[j]) >= iou)
-                            {
-                                toRemove.Add(predictions[j]);
-                            }
-                        }
-                    }
-
-                    // 批量移除
-                    predictions.RemoveAll(p => toRemove.Contains(p));
-
-                    // 批量缩放
-                    for (int i = 0; i < predictions.Count; i++)
-                    {
-                        predictions[i].X *= proportion_x;
-                        predictions[i].Y *= proportion_y;
-                        predictions[i].Width *= proportion_x;
-                        predictions[i].Height *= proportion_y;
-                    }
-                }
-            });
-
-            return dictionary;
         }
 
         /// <summary>
