@@ -1,4 +1,4 @@
-using Emgu.CV;
+﻿using Emgu.CV;
 using Emgu.CV.Structure;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -153,20 +153,21 @@ namespace BingLing.Yolov5Onnx.Gpu
             _reuseInputTensor = new DenseTensor<float>(dimensions);
         }
 
-        private Mat LetterboxImage(Mat img, Size newShape, Color color, bool auto = true, bool scaleFill = false, bool scaleup = true)
+        private Mat LetterboxImage(Mat img, Size newShape, Color color, bool auto = true, bool scaleFill = false, bool scaleup = true, int stride = 32)
         {
             float ratio = Math.Min((float)newShape.Width / img.Width, (float)newShape.Height / img.Height);
             if (!scaleup)
                 ratio = Math.Min(ratio, 1.0f);
 
-            int newUnpad = (int)Math.Round(img.Width * ratio), newUnpadH = (int)Math.Round(img.Height * ratio);
+            int newUnpad = (int)Math.Round(img.Width * ratio);
+            int newUnpadH = (int)Math.Round(img.Height * ratio);
             int dw = newShape.Width - newUnpad;
             int dh = newShape.Height - newUnpadH;
 
             if (auto)
             {
-                dw %= 32;
-                dh %= 32;
+                dw = dw % stride;
+                dh = dh % stride;
             }
 
             var resized = new Mat();
@@ -182,6 +183,55 @@ namespace BingLing.Yolov5Onnx.Gpu
             resized.Dispose();
 
             return padded;
+        }
+
+        private void PreprocessImage(Mat img, DenseTensor<float> tensor)
+        {
+            var imageData = img.GetData();
+            if (!(imageData is byte[,,] bytes)) return;
+
+            int height = img.Height;
+            int width = img.Width;
+            int channels = img.NumberOfChannels;
+            
+            // 使用分块并行处理
+            int blockSize = 32; // 每块32行
+            int numBlocks = (height + blockSize - 1) / blockSize;
+            
+            Parallel.For(0, numBlocks, block =>
+            {
+                int startY = block * blockSize;
+                int endY = Math.Min(startY + blockSize, height);
+                
+                for (int y = startY; y < endY; y++)
+                {
+                    for (int x = 0; x < width; x++)
+                    {
+                        tensor[0, 0, y, x] = bytes[y, x, 2] / 255.0f;  // R
+                        tensor[0, 1, y, x] = bytes[y, x, 1] / 255.0f;  // G
+                        tensor[0, 2, y, x] = bytes[y, x, 0] / 255.0f;  // B
+                    }
+                }
+            });
+        }
+
+        private float[,] ScaleBoxes(float[,] boxes, Size sourceSize, Size targetSize)
+        {
+            float gain_x = (float)targetSize.Width / sourceSize.Width;
+            float gain_y = (float)targetSize.Height / sourceSize.Height;
+            float min_gain = Math.Min(gain_x, gain_y);
+
+            float[,] scaled = new float[boxes.GetLength(0), boxes.GetLength(1)];
+            for (int i = 0; i < boxes.GetLength(0); i++)
+            {
+                scaled[i, 0] = boxes[i, 0] * gain_x;  // x1
+                scaled[i, 1] = boxes[i, 1] * gain_y;  // y1
+                scaled[i, 2] = boxes[i, 2] * gain_x;  // x2
+                scaled[i, 3] = boxes[i, 3] * gain_y;  // y2
+                scaled[i, 4] = boxes[i, 4];           // conf
+                scaled[i, 5] = boxes[i, 5];           // class
+            }
+            return scaled;
         }
 
         private ConcurrentDictionary<int, List<Prediction>> ProcessPredictions(float[] result, float proportion_x, float proportion_y, bool agnostic = false)
@@ -270,10 +320,11 @@ namespace BingLing.Yolov5Onnx.Gpu
             Mat letterboxed = null;
             try
             {
+                var originalSize = new Size(mat.Width, mat.Height);
                 processedImage = mat.Clone();
                 
-                // 使用letterbox预处理
-                letterboxed = LetterboxImage(mat, _modelInputSize, Color.FromArgb(114, 114, 114));
+                // 使用letterbox预处理，保持32的倍数
+                letterboxed = LetterboxImage(mat, _modelInputSize, Color.FromArgb(114, 114, 114), stride: 32);
                 
                 // 确保图像是连续的内存布局
                 if (!letterboxed.IsContinuous)
@@ -285,24 +336,8 @@ namespace BingLing.Yolov5Onnx.Gpu
 
                 lock (_bufferLock)
                 {
-                    // 使用更安全的方式复制数据
-                    var imageData = letterboxed.GetData();
-                    if (imageData is byte[,,] bytes)
-                    {
-                        // 使用SIMD优化的并行处理
-                        int height = letterboxed.Height;
-                        int width = letterboxed.Width;
-
-                        Parallel.For(0, height, i =>
-                        {
-                            for (int j = 0; j < width; j++)
-                            {
-                                _reuseInputTensor[0, 0, i, j] = bytes[i, j, 0] / 255f;
-                                _reuseInputTensor[0, 1, i, j] = bytes[i, j, 1] / 255f;
-                                _reuseInputTensor[0, 2, i, j] = bytes[i, j, 2] / 255f;
-                            }
-                        });
-                    }
+                    // 预处理图像数据
+                    PreprocessImage(letterboxed, _reuseInputTensor);
 
                     var inputs = new List<NamedOnnxValue>
                     {
@@ -312,36 +347,33 @@ namespace BingLing.Yolov5Onnx.Gpu
                     using var values = inference_session.Run(inputs);
                     float[] result = values.First(value => value.Name == _outputMetadataName).AsEnumerable<float>().ToArray();
 
-                    // 计算letterbox后的比例
-                    float proportion_x = 1f * mat.Width / letterboxed.Width;
-                    float proportion_y = 1f * mat.Height / letterboxed.Height;
-
-                    var predictions = ProcessPredictions(result, proportion_x, proportion_y, true);
+                    var predictions = ProcessPredictions(result, 1.0f, 1.0f, true);
                     
+                    // 转换预测结果为二维数组并缩放到原始图像尺寸
+                    var outputs = ConvertPredictionsToOutput(predictions);
+                    outputs = ScaleBoxes(outputs, new Size(letterboxed.Width, letterboxed.Height), originalSize);
+
                     // Draw boxes on the image
-                    foreach (var kvp in predictions)
+                    for (int i = 0; i < outputs.GetLength(0); i++)
                     {
-                        foreach (var pred in kvp.Value)
-                        {
-                            var rect = new Rectangle(
-                                (int)pred.X,
-                                (int)pred.Y,
-                                (int)pred.Width,
-                                (int)pred.Height
-                            );
-                            CvInvoke.Rectangle(processedImage, rect, new MCvScalar(0, 255, 0), 2);
-                            CvInvoke.PutText(processedImage, 
-                                $"{pred.Kind} {pred.Confidence:F2}", 
-                                new Point((int)pred.X, (int)pred.Y - 10),
-                                FontFace.HersheyTriplex,
-                                0.8,
-                                new MCvScalar(255, 0, 0),
-                                1,
-                                LineType.AntiAlias);
-                        }
+                        var rect = new Rectangle(
+                            (int)outputs[i, 0],
+                            (int)outputs[i, 1],
+                            (int)(outputs[i, 2] - outputs[i, 0]),
+                            (int)(outputs[i, 3] - outputs[i, 1])
+                        );
+                        
+                        CvInvoke.Rectangle(processedImage, rect, new MCvScalar(0, 255, 0), 2);
+                        CvInvoke.PutText(processedImage, 
+                            $"{(int)outputs[i, 5]} {outputs[i, 4]:F2}", 
+                            new Point((int)outputs[i, 0], (int)outputs[i, 1] - 10),
+                            FontFace.HersheyTriplex,
+                            0.8,
+                            new MCvScalar(255, 0, 0),
+                            1,
+                            LineType.AntiAlias);
                     }
 
-                    var outputs = ConvertPredictionsToOutput(predictions);
                     return new DetectionResult(processedImage, outputs);
                 }
             }
