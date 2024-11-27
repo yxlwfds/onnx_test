@@ -45,7 +45,7 @@ namespace BingLing.Yolov5Onnx.Gpu
             sessionOptions.AppendExecutionProvider_CUDA();
             
             // Set provider options after adding the provider
-            sessionOptions.AddSessionConfigEntry("session.use_fp16", "1");
+            // sessionOptions.AddSessionConfigEntry("session.use_fp16", "1");
             
             _inferenceSession = new InferenceSession(_modelPath, sessionOptions);
         }
