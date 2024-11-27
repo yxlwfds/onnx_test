@@ -73,7 +73,7 @@ namespace onnx_test
             {
                 stepStopwatch.Restart();
                 var boxList = ProcessDetectionBox(detectionBox);
-                Console.WriteLine($"[性能日志] 数据结构转换耗时: {stepStopwatch.ElapsedMilliseconds}ms");
+                ApplicationLogger.Instance.Info($"[性能日志] 数据结构转换耗时: {stepStopwatch.ElapsedMilliseconds}ms");
 
                 // 图像编码
                 stepStopwatch.Restart();
@@ -103,8 +103,8 @@ namespace onnx_test
                     await encoderStream.ReadAsync(imageBytes);
                 }
                 
-                Console.WriteLine($"[性能日志] 图像编码耗时: {stepStopwatch.ElapsedMilliseconds}ms");
-                Console.WriteLine($"[性能日志] 图像大小: {imageBytes.Length / 1024.0:F2}KB");
+                ApplicationLogger.Instance.Info($"[性能日志] 图像编码耗时: {stepStopwatch.ElapsedMilliseconds}ms");
+                ApplicationLogger.Instance.Info($"[性能日志] 图像大小: {imageBytes.Length / 1024.0:F2}KB");
 
                 // 发送数据到Redis
                 await ProcessDataWithRetry(async () =>
@@ -114,12 +114,11 @@ namespace onnx_test
                 });
 
                 totalStopwatch.Stop();
-                Console.WriteLine($"[性能日志] ProcessBox总耗时: {totalStopwatch.ElapsedMilliseconds}ms");
+                ApplicationLogger.Instance.Info($"[性能日志] ProcessBox总耗时: {totalStopwatch.ElapsedMilliseconds}ms");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error in ProcessBox: {ex.Message}");
-                throw;
+                ExceptionHandler.Instance.LogException(ex, $"ProcessBox for stream {_streamName}", true);
             }
             finally
             {
@@ -157,7 +156,7 @@ namespace onnx_test
                 new("timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString())
             };
             await _redisDb.StreamAddAsync(_streamName, streamEntries, maxLength: 50);
-            Console.WriteLine($"[性能日志] Redis Stream写入耗时: {stepStopwatch.ElapsedMilliseconds}ms");
+            ApplicationLogger.Instance.Info($"[性能日志] Redis Stream写入耗时: {stepStopwatch.ElapsedMilliseconds}ms");
         }
 
         private async Task SendToRedisList(string id, List<List<float>> boxList, byte[] imageBytes, System.Diagnostics.Stopwatch stepStopwatch)
@@ -181,7 +180,7 @@ namespace onnx_test
                 await _redisDb.ListLeftPushAsync("box_data_queue", jsonData);
                 await _redisDb.ListTrimAsync("box_data_queue", 0, 1000);
             }
-            Console.WriteLine($"[性能日志] Redis操作耗时: {stepStopwatch.ElapsedMilliseconds}ms");
+            ApplicationLogger.Instance.Info($"[性能日志] Redis操作耗时: {stepStopwatch.ElapsedMilliseconds}ms");
         }
 
         private static async Task ProcessDataWithRetry(Func<Task> action, int maxRetries = 3)

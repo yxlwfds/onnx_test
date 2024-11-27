@@ -1,4 +1,4 @@
-﻿using Emgu.CV;
+using Emgu.CV;
 using Emgu.CV.Structure;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -8,6 +8,7 @@ using System.Drawing;
 using System.Linq;
 using System.Runtime.InteropServices;
 using Emgu.CV.CvEnum;
+using onnx_test;
 
 namespace BingLing.Yolov5Onnx.Gpu
 {
@@ -377,8 +378,9 @@ namespace BingLing.Yolov5Onnx.Gpu
                     return new DetectionResult(processedImage, outputs);
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                ApplicationLogger.Instance.Error($"Error during detection: {ex.Message}", ex);
                 processedImage?.Dispose();
                 letterboxed?.Dispose();
                 throw;

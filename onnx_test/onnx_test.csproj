@@ -16,8 +16,15 @@
     <PackageReference Include="Emgu.CV.runtime.windows" Version="4.9.0.5494" />
     <PackageReference Include="Emgu.CV.runtime.windows.cuda" Version="4.4.0.4099" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.18.0" />
+    <PackageReference Include="NLog" Version="5.2.8" />
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.6" />
     <PackageReference Include="StackExchange.Redis" Version="2.8.16" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="nlog.config">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

@@ -9,6 +9,9 @@ using System.Text;
 using System.Runtime.InteropServices;
 using System.IO;
 using onnx_test;
+using NLog;
+
+using CustomLogger = onnx_test.ApplicationLogger;
 
 namespace TestNugetCpuOnnx
 {
@@ -16,9 +19,15 @@ namespace TestNugetCpuOnnx
     {
         static async Task Main(string[] args)
         {
+            // 确保日志目录存在
+            Directory.CreateDirectory(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs"));
+            
+            // 加载NLog配置
+            LogManager.LoadConfiguration("nlog.config");
+            
             if (args.Length != 2)
             {
-                Console.WriteLine("Usage: program <stream_name> <config_file_path>");
+                ApplicationLogger.Instance.Error("Usage: program <stream_name> <config_file_path>");
                 return;
             }
 
@@ -27,7 +36,7 @@ namespace TestNugetCpuOnnx
 
             if (!File.Exists(configPath))
             {
-                Console.WriteLine($"Error: Configuration file not found at path: {configPath}");
+                ApplicationLogger.Instance.Error($"Error: Configuration file not found at path: {configPath}");
                 return;
             }
 
@@ -35,7 +44,7 @@ namespace TestNugetCpuOnnx
 
             try
             {
-                Console.WriteLine("配置文件路径:" + configPath);
+                ApplicationLogger.Instance.Info("配置文件路径:" + configPath);
 
                 // Initialize model and GPU resources
                 ModelManager.Initialize(configPath);
@@ -48,7 +57,7 @@ namespace TestNugetCpuOnnx
                 MCvScalar color = new(255, 0, 0);
 
                 // Warm up the model
-                Console.WriteLine("模型预热...");
+                ApplicationLogger.Instance.Info("模型预热...");
                 using (var warmupMat = new Mat(640, 640, Emgu.CV.CvEnum.DepthType.Cv8U, 3))
                 {
                     yolov5Onnx.DetectLetItRot(warmupMat);
@@ -59,7 +68,7 @@ namespace TestNugetCpuOnnx
                 using (var dataSender = new DataSender(streamName))
                 {
 
-                    Console.WriteLine("开始从Redis流中读取帧...");
+                    ApplicationLogger.Instance.Info("开始从Redis流中读取帧...");
                     while (true)
                     {
                         await Task.Delay(1);
@@ -76,7 +85,7 @@ namespace TestNugetCpuOnnx
                         var status = await RedisConnectionManager.Instance.HashGetAsync($"stream_info_{streamName}", "status");
                         if (status == "offline")
                         {
-                            Console.WriteLine($"Stream {streamName} is offline. Waiting...");
+                            ApplicationLogger.Instance.Warning($"Stream {streamName} is offline. Waiting...");
                             await Task.Delay(1000);
                         }
 
@@ -97,8 +106,7 @@ namespace TestNugetCpuOnnx
                                 {
                                     // Convert byte array to Mat
                                     byte[] imageBytes = (byte[])frameData;
-                                    Console.WriteLine($"图像字节数: {imageBytes.Length} 字节");
-                                    // Console.WriteLine($"前10个字节: {BitConverter.ToString(imageBytes.Take(10).ToArray())}");
+                                    ApplicationLogger.Instance.Debug($"图像字节数: {imageBytes.Length} 字节");
 
                                     try
                                     {
@@ -106,7 +114,7 @@ namespace TestNugetCpuOnnx
                                         Marshal.Copy(imageBytes, 0, frame.DataPointer, imageBytes.Length);
                                         if (!frame.IsEmpty)
                                         {
-                                            Console.WriteLine($"图像尺寸: {frame.Size}");
+                                            ApplicationLogger.Instance.Debug($"图像尺寸: {frame.Size}");
                                             // Perform inference
                                             var stopwatch = Stopwatch.StartNew();
                                             var detectionResult = yolov5Onnx.DetectLetItRot(frame);
@@ -115,11 +123,11 @@ namespace TestNugetCpuOnnx
                                             // Add null check for detectionResult
                                             if (detectionResult == null)
                                             {
-                                                Console.WriteLine("检测结果为空");
+                                                ApplicationLogger.Instance.Warning("检测结果为空");
                                                 continue;  // Skip to next iteration
                                             }
 
-                                            Console.WriteLine($"推理完成. 耗时: {stopwatch.ElapsedMilliseconds}毫秒");
+                                            ApplicationLogger.Instance.Info($"推理完成. 耗时: {stopwatch.ElapsedMilliseconds}毫秒");
 
                                             // 获取处理后的图片和检测框数据
                                             using (Mat processedImage = detectionResult.ProcessedImage)
@@ -134,7 +142,7 @@ namespace TestNugetCpuOnnx
                                                     {
                                                        await dataSender.ProcessBox(streamName, detections, processedImage);
 
-                                                        Console.WriteLine($"检测到的物体数量: {detections.GetLength(0)}");
+                                                        ApplicationLogger.Instance.Info($"检测到的物体数量: {detections.GetLength(0)}");
 
                                                         // 处理每个检测框的数据
                                                         for (int i = 0; i < detections.GetLength(0); i++)
@@ -146,21 +154,21 @@ namespace TestNugetCpuOnnx
                                                             float confidence = detections[i, 4];
                                                             int classId = (int)detections[i, 5];
 
-                                                            Console.WriteLine($"检测框 {i + 1}:");
-                                                            Console.WriteLine($"  位置: ({x1}, {y1}) - ({x2}, {y2})");
-                                                            Console.WriteLine($"  置信度: {confidence:F2}");
-                                                            Console.WriteLine($"  类别ID: {classId}");
+                                                            ApplicationLogger.Instance.Info($"检测框 {i + 1}:");
+                                                            ApplicationLogger.Instance.Info($"  位置: ({x1}, {y1}) - ({x2}, {y2})");
+                                                            ApplicationLogger.Instance.Info($"  置信度: {confidence:F2}");
+                                                            ApplicationLogger.Instance.Info($"  类别ID: {classId}");
                                                         }
                                                     }
                                                 }
                                             }
                                         }
                                         frameProcessingStopwatch.Stop();
-                                        Console.WriteLine($"帧处理总耗时: {frameProcessingStopwatch.ElapsedMilliseconds}毫秒");
+                                        ApplicationLogger.Instance.Info($"帧处理总耗时: {frameProcessingStopwatch.ElapsedMilliseconds}毫秒");
                                     }
                                     catch (Exception ex)
                                     {
-                                        Console.WriteLine($"处理图像时出错: {ex.Message}");
+                                        ApplicationLogger.Instance.Error($"处理图像时出错: {ex.Message}");
                                     }
                                 }
                             }
@@ -171,8 +179,8 @@ namespace TestNugetCpuOnnx
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"发生错误: {ex.Message}");
-                Console.WriteLine(ex.StackTrace);
+                ApplicationLogger.Instance.Error($"发生错误: {ex.Message}");
+                ApplicationLogger.Instance.Error(ex.StackTrace);
             }
             finally
             {

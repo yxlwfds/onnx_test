@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Text;
+using onnx_test;
 
 namespace BingLing.Yolov5Onnx.Gpu
 {
@@ -44,7 +45,7 @@ namespace BingLing.Yolov5Onnx.Gpu
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error getting GPU info: {ex.Message}");
+                ApplicationLogger.Instance.Error($"Error getting GPU info: {ex.Message}", ex);
             }
             return gpus;
         }
