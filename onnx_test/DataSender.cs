@@ -5,6 +5,9 @@ using StackExchange.Redis;
 using Emgu.CV;
 using Emgu.CV.CvEnum;
 using Emgu.CV.Util;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats.Jpeg;
+using SixLabors.ImageSharp.PixelFormats;
 
 namespace onnx_test
 {
@@ -47,16 +50,28 @@ namespace onnx_test
                 // Encode image to JPEG bytes
                 stepStopwatch.Restart();
                 byte[] imageBytes;
-                using (var vectorByte = new VectorOfByte())
+                
+                // 从Mat获取原始图像数据
+                using var matData = processedImage.GetUMat(Emgu.CV.CvEnum.AccessType.Read);
+                byte[] rawData = new byte[processedImage.Height * processedImage.Width * processedImage.NumberOfChannels];
+                matData.CopyTo(rawData);
+
+                // 使用ImageSharp进行高性能编码
+                using (var image = Image.LoadPixelData<Rgb24>(rawData, processedImage.Width, processedImage.Height))
+                using (var ms = new MemoryStream())
                 {
-                    // 使用JPEG格式，质量设为80（0-100之间，值越大质量越好，但文件更大）
-                    CvInvoke.Imencode(".jpg", processedImage, vectorByte,
-                    [
-                        new(ImwriteFlags.JpegQuality, 80),
-                        new(ImwriteFlags.JpegOptimize, 1)
-                    ]);
-                    imageBytes = vectorByte.ToArray();
+                    // 配置JPEG编码器以获得最佳性能
+                    var encoder = new JpegEncoder
+                    {
+                        Quality = 80,  // 0-100
+                        Interleaved = true  // 启用交错编码以提高性能
+                        // 移除 OptimizeEncoding，因为最新版本不再需要此属性
+                    };
+                    
+                    image.Save(ms, encoder);
+                    imageBytes = ms.ToArray();
                 }
+                
                 Console.WriteLine($"[性能日志] 图像编码耗时: {stepStopwatch.ElapsedMilliseconds}ms");
                 Console.WriteLine($"[性能日志] 图像大小: {imageBytes.Length / 1024.0:F2}KB");
 
