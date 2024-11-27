@@ -1,13 +1,19 @@
-using Emgu.CV;
+﻿using Emgu.CV;
 using Emgu.CV.Structure;
+using Emgu.CV.CvEnum;
+using Emgu.CV.Cuda;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using Newtonsoft.Json;
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using Emgu.CV.CvEnum;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace BingLing.Yolov5Onnx.Gpu
 {
@@ -169,11 +175,13 @@ namespace BingLing.Yolov5Onnx.Gpu
             try
             {
                 processedImage = mat.Clone();
-                CvInvoke.Resize(mat, _resizedMat, _modelInputSize);
-
+                
+                // 使用LetterboxImage进行预处理
+                using var letterboxed = LetterboxImage(mat, _modelInputSize, new MCvScalar(114, 114, 114));
+                
                 lock (_bufferLock)
                 {
-                    Marshal.Copy(_resizedMat.DataPointer, _imageBuffer, 0, _imageBuffer.Length);
+                    Marshal.Copy(letterboxed.DataPointer, _imageBuffer, 0, _imageBuffer.Length);
 
                     // 使用SIMD优化的并行处理
                     int pixelCount = _modelInputSize.Width * _modelInputSize.Height;
@@ -190,21 +198,24 @@ namespace BingLing.Yolov5Onnx.Gpu
                             int col = pixelIdx % _modelInputSize.Width;
                             int srcIdx = baseIdx + j * 3;
 
-                            _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx] / 255f;
-                            _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f;
-                            _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx + 2] / 255f;
+                            // BGR to RGB conversion
+                            _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx] / 255f;     // B -> R
+                            _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f; // G -> G
+                            _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx + 2] / 255f; // R -> B
                         }
                     });
 
+                    // 处理剩余的像素
                     for (int i = remainingStart; i < pixelCount; i++)
                     {
                         int row = i / _modelInputSize.Width;
                         int col = i % _modelInputSize.Width;
                         int srcIdx = i * 3;
 
-                        _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx] / 255f;
-                        _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f;
-                        _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx + 2] / 255f;
+                        // BGR to RGB conversion
+                        _reuseInputTensor[0, 2, row, col] = _imageBuffer[srcIdx] / 255f;     // B -> R
+                        _reuseInputTensor[0, 1, row, col] = _imageBuffer[srcIdx + 1] / 255f; // G -> G
+                        _reuseInputTensor[0, 0, row, col] = _imageBuffer[srcIdx + 2] / 255f; // R -> B
                     }
 
                     var inputs = new List<NamedOnnxValue>
@@ -529,6 +540,85 @@ namespace BingLing.Yolov5Onnx.Gpu
             });
 
             return dictionary;
+        }
+
+        /// <summary>
+        /// 优化的图像缩放方法
+        /// </summary>
+        private void OptimizedResize(Mat src, Mat dst, Size size, Inter interpolation = Inter.Linear)
+        {
+            if (!CudaInvoke.HasCuda)
+            {
+                CvInvoke.Resize(src, dst, size, 0, 0, interpolation);
+                return;
+            }
+
+            using (GpuMat gpuMatSrc = new GpuMat())
+            using (GpuMat gpuMatDst = new GpuMat())
+            {
+                gpuMatSrc.Upload(src);
+                CudaInvoke.Resize(gpuMatSrc, gpuMatDst, size);
+                gpuMatDst.Download(dst);
+            }
+        }
+
+        /// <summary>
+        /// 使用letterbox方法调整图像大小，保持宽高比
+        /// </summary>
+        private Mat LetterboxImage(Mat img, Size newShape, MCvScalar color, bool auto = true, bool scaleFill = false, bool scaleup = true, int stride = 32)
+        {
+            // 计算缩放比例和填充
+            float ratio = Math.Min((float)newShape.Width / img.Width, (float)newShape.Height / img.Height);
+            if (!scaleup)
+            {
+                ratio = Math.Min(ratio, 1.0f);
+            }
+
+            // 计算新的未填充尺寸
+            int newUnpadWidth = (int)Math.Round(img.Width * ratio);
+            int newUnpadHeight = (int)Math.Round(img.Height * ratio);
+
+            int dw = newShape.Width - newUnpadWidth;
+            int dh = newShape.Height - newUnpadHeight;
+
+            if (auto) // 最小矩形
+            {
+                dw %= stride;
+                dh %= stride;
+            }
+
+            // 均匀分配填充
+            int dw_2 = dw / 2;
+            int dh_2 = dh / 2;
+
+            // 创建输出图像
+            Mat resized = new Mat();
+            
+            // 选择合适的插值方法
+            Inter interpolation = ratio > 1 ? 
+                Inter.Area :  // 缩小时使用Area插值
+                Inter.Linear;  // 放大时使用LinearExact插值
+            
+            // 使用优化的缩放方法
+            OptimizedResize(img, resized, new Size(newUnpadWidth, newUnpadHeight), interpolation);
+
+            Mat result = new Mat(newShape, img.Depth, img.NumberOfChannels);
+            result.SetTo(color);
+
+            // 复制调整大小的图像到填充图像的中心
+            if (dw_2 > 0 && dh_2 > 0)
+            {
+                var roi = new Rectangle(dw_2, dh_2, newUnpadWidth, newUnpadHeight);
+                Mat resultRoi = new Mat(result, roi);
+                resized.CopyTo(resultRoi);
+            }
+            else
+            {
+                resized.CopyTo(result);
+            }
+
+            resized.Dispose();
+            return result;
         }
 
         public class DetectionResult
