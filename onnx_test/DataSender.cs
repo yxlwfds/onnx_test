@@ -64,10 +64,10 @@ namespace onnx_test
             var stepStopwatch = new System.Diagnostics.Stopwatch();
 
             // 从内存池租用数组和流
-            byte[] rawData = null;
-            byte[] imageBytes = null;
-            MemoryStream encoderStream = null;
-            MemoryStream base64Stream = null;
+            byte[]? rawData = default;
+            byte[]? imageBytes = default;
+            MemoryStream? encoderStream = default;
+            MemoryStream? base64Stream = default;
 
             try
             {
@@ -149,6 +149,12 @@ namespace onnx_test
 
         private async Task SendToRedisStream(byte[] imageBytes, System.Diagnostics.Stopwatch stepStopwatch)
         {
+            if (imageBytes == null || imageBytes.Length == 0)
+            {
+                ApplicationLogger.Instance.Warning("图像数据为空，跳过Redis Stream发送");
+                return;
+            }
+
             stepStopwatch.Restart();
             var streamEntries = new NameValueEntry[]
             {
@@ -161,6 +167,12 @@ namespace onnx_test
 
         private async Task SendToRedisList(string id, List<List<float>> boxList, byte[] imageBytes, System.Diagnostics.Stopwatch stepStopwatch)
         {
+            if (string.IsNullOrEmpty(id) || boxList == null || !boxList.Any() || imageBytes == null || imageBytes.Length == 0)
+            {
+                ApplicationLogger.Instance.Warning("数据为空，跳过Redis List发送");
+                return;
+            }
+
             stepStopwatch.Restart();
             using var base64Stream = ImageArrayPool.Instance.RentStream();
             using (var writer = new StreamWriter(base64Stream, leaveOpen: true))

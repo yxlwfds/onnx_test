@@ -64,7 +64,6 @@ namespace TestNugetCpuOnnx
                 }
 
                 // 预分配可重用的 Mat
-                using (var frame = new Mat(640, 640, DepthType.Cv8U, 3))
                 using (var dataSender = new DataSender(streamName))
                 {
 
@@ -111,54 +110,48 @@ namespace TestNugetCpuOnnx
                                     try
                                     {
                                         var frameProcessingStopwatch = Stopwatch.StartNew();
-                                        Marshal.Copy(imageBytes, 0, frame.DataPointer, imageBytes.Length);
-                                        if (!frame.IsEmpty)
+                                        
+                                        // Convert byte array to Mat and pass directly to model
+                                        using (var currentFrame = new Mat(1, imageBytes.Length, DepthType.Cv8U, 1))
                                         {
-                                            ApplicationLogger.Instance.Debug($"图像尺寸: {frame.Size}");
+                                            Marshal.Copy(imageBytes, 0, currentFrame.DataPointer, imageBytes.Length);
+                                            
                                             // Perform inference
                                             var stopwatch = Stopwatch.StartNew();
-                                            var detectionResult = yolov5Onnx.DetectLetItRot(frame);
+                                            var detectionResult = yolov5Onnx.DetectLetItRot(currentFrame);
                                             stopwatch.Stop();
 
-                                            // Add null check for detectionResult
                                             if (detectionResult == null)
                                             {
                                                 ApplicationLogger.Instance.Warning("检测结果为空");
-                                                continue;  // Skip to next iteration
+                                                continue;
                                             }
 
                                             ApplicationLogger.Instance.Info($"推理完成. 耗时: {stopwatch.ElapsedMilliseconds}毫秒");
 
-                                            // 获取处理后的图片和检测框数据
                                             using (Mat processedImage = detectionResult.ProcessedImage)
                                             {
                                                 float[,] detections = detectionResult.Outputs;
 
-                                                // 打印检测到的物体数量
-                                                if (detections != null)
+                                                if (detections != null && detections.Length > 0 && dataSender != null)
                                                 {
-                                                    // 只有当检测到物体时才发送数据到队列
-                                                    if (detections.Length > 0 && dataSender != null)
+                                                    await dataSender.ProcessBox(streamName, detections, processedImage);
+
+                                                    ApplicationLogger.Instance.Info($"检测到的物体数量: {detections.GetLength(0)}");
+
+                                                    for (int i = 0; i < detections.GetLength(0); i++)
                                                     {
-                                                       await dataSender.ProcessBox(streamName, detections, processedImage);
+                                                        float x1 = detections[i, 0];
+                                                        float y1 = detections[i, 1];
+                                                        float x2 = detections[i, 2];
+                                                        float y2 = detections[i, 3];
+                                                        float confidence = detections[i, 4];
+                                                        int classId = (int)detections[i, 5];
 
-                                                        ApplicationLogger.Instance.Info($"检测到的物体数量: {detections.GetLength(0)}");
-
-                                                        // 处理每个检测框的数据
-                                                        for (int i = 0; i < detections.GetLength(0); i++)
-                                                        {
-                                                            float x1 = detections[i, 0];
-                                                            float y1 = detections[i, 1];
-                                                            float x2 = detections[i, 2];
-                                                            float y2 = detections[i, 3];
-                                                            float confidence = detections[i, 4];
-                                                            int classId = (int)detections[i, 5];
-
-                                                            ApplicationLogger.Instance.Info($"检测框 {i + 1}:");
-                                                            ApplicationLogger.Instance.Info($"  位置: ({x1}, {y1}) - ({x2}, {y2})");
-                                                            ApplicationLogger.Instance.Info($"  置信度: {confidence:F2}");
-                                                            ApplicationLogger.Instance.Info($"  类别ID: {classId}");
-                                                        }
+                                                        ApplicationLogger.Instance.Info($"检测框 {i + 1}:");
+                                                        ApplicationLogger.Instance.Info($"  位置: ({x1}, {y1}) - ({x2}, {y2})");
+                                                        ApplicationLogger.Instance.Info($"  置信度: {confidence:F2}");
+                                                        ApplicationLogger.Instance.Info($"  类别ID: {classId}");
                                                     }
                                                 }
                                             }

@@ -266,7 +266,7 @@ class Service:
         """
         data_box = json.dumps(num_box.tolist())
         np_img = np.array(out_img)
-        _, buffer = cv2.imencode('.png', np_img, [int(cv2.IMWRITE_PNG_COMPRESSION), 90])
+        _, buffer = cv2.imencode('.jpeg', np_img, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         img_base64 = base64.b64encode(buffer.tobytes()).decode('utf-8')
         # 保存img_base64到文件
         # with open(f"{image_base}/{d.id}/{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}.png", "wb") as f:

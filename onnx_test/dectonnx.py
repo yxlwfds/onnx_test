@@ -27,7 +27,7 @@ def onnx_inf_sess(sess, data):
     input_name = sess.get_inputs()[0].name
     output_name = sess.get_outputs()[0].name
 
-    pred_onnx = sess.run([output_name], {input_name: data.reshape(1, 3, 640, 640).astype(np.float16)})
+    pred_onnx = sess.run([output_name], {input_name: data.reshape(1, 3, 640, 640).astype(np.float32)})
 
     return pred_onnx
 
